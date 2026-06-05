@@ -21,7 +21,7 @@ This tool helps answer: "Which function increases memory traffic right now?"
 ## Build (Windows)
 
 Requirements:
-- CMake 3.20+
+- CMake 3.20+ (CMake 4.2+ is required when using Visual Studio 2026 generator)
 - A C++20 compiler (MSVC recommended on Windows)
 
 Build commands:
@@ -30,6 +30,28 @@ Build commands:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
+
+MSBuild directly (auto-detect from installed Visual Studio):
+
+```powershell
+.\scripts\use-msbuild.ps1
+```
+
+Run MSBuild with arguments (example):
+
+```powershell
+.\scripts\use-msbuild.ps1 .\build-vs\memory_bandwidth_monitor_for_AI.slnx /t:mbm_cli /p:Configuration=Release /p:Platform=x64
+```
+
+Note:
+- In this environment, Visual Studio Professional 2026 is installed.
+- Use this configure command for Visual Studio 2026:
+
+```powershell
+"C:\Program Files\CMake\bin\cmake.exe" -S . -B build-vs -G "Visual Studio 18 2026" -A x64
+```
+
+- CMake 4.x with Visual Studio 2026 generates `.slnx` by default.
 
 Binary:
 - `build/Release/mbm_cli.exe` (multi-config generator)

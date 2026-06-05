@@ -18,7 +18,7 @@ add_executable(mbm_cli
     src/main.cpp
 )
 
-target_link_libraries(mbm PRIVATE mbm)
+target_link_libraries(mbm_cli PRIVATE mbm)
 
 if(WIN32)
     target_link_libraries(mbm_cli PRIVATE psapi)
