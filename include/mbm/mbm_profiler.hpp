@@ -9,9 +9,9 @@ namespace mbm {
 
 struct FunctionWindowStat {
     std::string name;
-    std::uint64_t calls = 0;
-    std::uint64_t bytes = 0;
-    std::uint64_t total_ns = 0;
+    std::uint64_t calls{0};
+    std::uint64_t bytes{0};
+    std::uint64_t total_ns{0};
 };
 
 struct WindowSnapshot {
@@ -46,10 +46,10 @@ public:
     ScopeGuard& operator=(const ScopeGuard&) = delete;
 
 private:
-    bool active_ = false;
+    bool active_{false};
 };
 
 } // namespace mbm
 
 #define MBM_SCOPE(name_literal) ::mbm::ScopeGuard mbm_scope_guard_##__LINE__(name_literal)
-#define MBM_ADD_BYTES(byte_count) ::mbm::Profiler::instance().addBytes(static_cast<std::uint64_t>(byte_count))
+#define MBM_ADD_BYTES(byte_count) ::mbm::Profiler::instance().addBytes(byte_count)

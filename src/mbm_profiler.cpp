@@ -9,22 +9,22 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 struct ScopeFrame {
-    const char* name = nullptr;
+    const char* name{nullptr};
     Clock::time_point start;
-    std::uint64_t bytes = 0;
+    std::uint64_t bytes{0};
 };
 
 struct MutableStat {
-    std::uint64_t calls = 0;
-    std::uint64_t bytes = 0;
-    std::uint64_t total_ns = 0;
+    std::uint64_t calls{0};
+    std::uint64_t bytes{0};
+    std::uint64_t total_ns{0};
 };
 
 thread_local std::vector<ScopeFrame> g_scope_stack;
 
 class ProfilerImpl {
 public:
-    Clock::time_point window_start = Clock::now();
+    Clock::time_point window_start{Clock::now()};
     std::unordered_map<std::string, MutableStat> window_stats;
     std::mutex mutex;
 };
@@ -45,7 +45,7 @@ Profiler::Profiler() = default;
 Profiler::~Profiler() = default;
 
 void Profiler::enterScope(const char* function_name) {
-    ScopeFrame frame;
+    ScopeFrame frame{};
     frame.name = function_name;
     frame.start = Clock::now();
     g_scope_stack.push_back(frame);
@@ -63,31 +63,30 @@ void Profiler::leaveScope() {
         return;
     }
 
-    ScopeFrame frame = g_scope_stack.back();
+    ScopeFrame frame{g_scope_stack.back()};
     g_scope_stack.pop_back();
 
-    const auto end = Clock::now();
-    const auto elapsed_ns =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - frame.start).count());
+    const auto end{Clock::now()};
+    const auto elapsed_ns{std::chrono::duration_cast<std::chrono::nanoseconds>(end - frame.start).count()};
 
-    auto& state = impl();
+    auto& state{impl()};
     std::lock_guard<std::mutex> lock(state.mutex);
-    auto& stat = state.window_stats[frame.name];
+    auto& stat{state.window_stats[frame.name]};
     stat.calls += 1;
     stat.bytes += frame.bytes;
     stat.total_ns += elapsed_ns;
 }
 
 WindowSnapshot Profiler::consumeWindow() {
-    WindowSnapshot snapshot;
-    auto& state = impl();
+    WindowSnapshot snapshot{};
+    auto& state{impl()};
     std::lock_guard<std::mutex> lock(state.mutex);
 
     snapshot.from = state.window_start;
     snapshot.to = Clock::now();
     snapshot.functions.reserve(state.window_stats.size());
     for (const auto& [name, stat] : state.window_stats) {
-        FunctionWindowStat out;
+        FunctionWindowStat out{};
         out.name = name;
         out.calls = stat.calls;
         out.bytes = stat.bytes;
@@ -100,7 +99,7 @@ WindowSnapshot Profiler::consumeWindow() {
     return snapshot;
 }
 
-ScopeGuard::ScopeGuard(const char* function_name) : active_(true) {
+ScopeGuard::ScopeGuard(const char* function_name) : active_{true} {
     Profiler::instance().enterScope(function_name);
 }
 
