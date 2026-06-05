@@ -18,6 +18,55 @@ A real-time CLI tool that estimates memory bandwidth and shows which functions a
 Many AI workloads are memory-bound in embedding lookup, attention, and normalization paths.
 This tool helps answer: "Which function increases memory traffic right now?"
 
+## Architecture
+
+```mermaid
+flowchart LR
+	subgraph App[AI Workload in mbm_cli]
+		W1[simulate_embedding_lookup]
+		W2[simulate_layer_norm]
+		W3[simulate_attention_score]
+		W4[simulate_matmul_tiled]
+	end
+
+	subgraph Inst[Instrumentation Layer]
+		SCOPE[MBM_SCOPE name]
+		BYTES[MBM_ADD_BYTES n]
+		SG[ScopeGuard RAII]
+	end
+
+	subgraph Core[Profiler Core]
+		TLS[thread_local scope stack]
+		AGG[window_stats map + mutex]
+		SNAP[consumeWindow snapshot]
+	end
+
+	subgraph Sys[System Context]
+		PMEM[sampleProcessMemory]
+	end
+
+	subgraph View[CLI Output]
+		RENDER[printSnapshot]
+		TABLE[Top functions MB/s table]
+	end
+
+	W1 --> SCOPE
+	W2 --> SCOPE
+	W3 --> SCOPE
+	W4 --> SCOPE
+
+	W1 --> BYTES
+	W2 --> BYTES
+	W3 --> BYTES
+	W4 --> BYTES
+
+	SCOPE --> SG --> TLS
+	BYTES --> TLS
+	TLS --> AGG --> SNAP
+	PMEM --> RENDER
+	SNAP --> RENDER --> TABLE
+```
+
 ## Build (Windows)
 
 Requirements:
