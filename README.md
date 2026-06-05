@@ -4,19 +4,31 @@ A real-time CLI tool that estimates memory bandwidth and shows which functions a
 
 ## What this tool does
 
-- Real-time throughput view (windowed MB/s)
-- Per-function impact table:
-- Function name
-- Calls in interval
-- Bytes touched in interval
-- Estimated MB/s contribution
-- Average latency per call
-- Process memory context (working set, private bytes, page-fault rate)
+- System mode (default):
+  - System physical memory used/free/committed
+  - Measured read+write memory bandwidth from a short system memory probe
+- Demo/instrumentation mode:
+  - Real-time throughput view (windowed MB/s)
+  - Per-function impact table:
+  - Function name
+  - Calls in interval
+  - Bytes touched in interval
+  - Estimated MB/s contribution
+  - Average latency per call
+- External process mode:
+  - Monitor another process by PID or executable name
+  - Working set
+  - Private bytes
+  - Page-fault rate
+  - Explicitly reports that external-process bandwidth needs a hardware-counter backend
 
 ## Why this is useful for AI apps
 
 Many AI workloads are memory-bound in embedding lookup, attention, and normalization paths.
 This tool helps answer: "Which function increases memory traffic right now?"
+
+For another running application, this tool currently answers a narrower first question:
+"How is this process memory footprint changing right now?"
 
 ## Architecture
 
@@ -108,6 +120,24 @@ Binary:
 
 ## Run
 
+Default system memory bandwidth view:
+
+```powershell
+./build/Release/mbm_cli.exe
+```
+
+Tune the bandwidth probe:
+
+```powershell
+./build/Release/mbm_cli.exe --workers 4 --probe-mb 256 --interval-ms 500
+```
+
+Override the theoretical RAM bandwidth used as the 100% scale:
+
+```powershell
+./build/Release/mbm_cli.exe --theoretical-gbs 51.2
+```
+
 Demo mode (generates AI-like workloads and profiles them):
 
 ```powershell
@@ -118,6 +148,32 @@ Run for a fixed duration:
 
 ```powershell
 ./build/Release/mbm_cli.exe --demo --duration-sec 10
+```
+
+List selectable devices:
+
+```powershell
+./build/Release/mbm_cli.exe --list-devices
+```
+
+Select CPU or GPU target:
+
+```powershell
+./build/Release/mbm_cli.exe --device cpu
+./build/Release/mbm_cli.exe --device gpu --gpu-index 0
+```
+
+Monitor another process:
+
+```powershell
+./build/Release/mbm_cli.exe --pid 1234
+./build/Release/mbm_cli.exe --process-name python.exe
+```
+
+External process mode can be combined with device selection:
+
+```powershell
+./build/Release/mbm_cli.exe --process-name python.exe --device gpu --gpu-index 0
 ```
 
 Stop with `Ctrl+C`.
@@ -144,17 +200,20 @@ Notes:
 
 ## Limitations
 
-- This is function-level estimated bandwidth, not direct DRAM hardware counter sampling.
+- Default system mode measures read+write bandwidth with a short memory probe, not direct DRAM hardware counters.
+- Demo mode is function-level estimated bandwidth, not direct DRAM hardware counter sampling.
 - Accuracy depends on correct byte annotations in hot paths.
+- `--pid` and `--process-name` monitor process memory state only. They do not yet report CPU/GPU memory bandwidth for that process.
+- GPU selection currently identifies the target adapter in the CLI output; bandwidth values still come from `MBM_ADD_BYTES` annotations, not GPU hardware counters.
 - For CPU-uncore hardware counters, platform-specific tools (for example Intel PCM) are needed.
 
 ## Output example (simplified)
 
 ```text
-window=500ms total=18432.7 MB/s ws=1420.3 MB private=1172.0 MB pf_rate=42.0/s
---------------------------------------------------------------------------------
-Function                         Calls      MB/s        MB       Avg us
-simulate_matmul_tiled             388     9112.4    4556.2      512.10
-simulate_attention_score          1552     5278.1    2639.1      118.44
-simulate_layer_norm               3104     2011.6    1005.8       33.28
+MBM system memory monitor                   device CPU
+Window: 675 ms   Workers: 6   Probe: 256 MB   Max: 51.2 GB/s   Sample: 174 ms
+ RAM  [||||||||||||||||||                      ]    14.2 GB /    31.7 GB  load 44%
+ Free [||||||||||||||||||||||                  ]    17.5 GB available
+ Cmit [|||||||||||||||||||                     ]    23.7 GB /    50.9 GB committed
+ BW   [|||||||||||||||||||||||||               ]    32.6 GB/s /  51.2 GB/s   64% measured read+write
 ```
