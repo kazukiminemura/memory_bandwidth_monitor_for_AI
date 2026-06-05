@@ -22,6 +22,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi1_6.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #endif
@@ -43,6 +45,7 @@ struct Options {
     int top = 10;
     int probe_mb = 256;
     double theoretical_bandwidth_gbs = 51.2;
+    double gpu_vram_bandwidth_gbs = 456.0;
     std::string device = "cpu";
     int gpu_index = 0;
     bool list_devices = false;
@@ -73,9 +76,16 @@ struct BandwidthProbeSnapshot {
     std::uint64_t bytes = 0;
 };
 
+struct GpuMemorySnapshot {
+    double dedicated_used_mb = 0.0;
+    double dedicated_total_mb = 0.0;
+    bool valid = false;
+};
+
 struct GpuDevice {
     int index = 0;
     std::string name;
+    double dedicated_memory_mb = 0.0;
 };
 
 struct ProcessTarget {
@@ -195,6 +205,7 @@ std::vector<GpuDevice> enumerateGpuDevices() {
             GpuDevice device;
             device.index = static_cast<int>(devices.size());
             device.name = narrow(desc.Description);
+            device.dedicated_memory_mb = static_cast<double>(desc.DedicatedVideoMemory) / (1024.0 * 1024.0);
             devices.push_back(std::move(device));
         }
         adapter->Release();
@@ -217,6 +228,70 @@ std::string targetDeviceLabel(const Options& opt) {
     }
 
     return "GPU[" + std::to_string(opt.gpu_index) + "] unavailable";
+}
+
+std::string gpuDeviceLabel(int gpu_index) {
+    const auto gpus = enumerateGpuDevices();
+    if (gpu_index >= 0 && gpu_index < static_cast<int>(gpus.size())) {
+        return "GPU[" + std::to_string(gpu_index) + "] " + gpus[static_cast<std::size_t>(gpu_index)].name;
+    }
+
+    return "GPU[" + std::to_string(gpu_index) + "]";
+}
+
+double gpuDedicatedMemoryMb(int gpu_index) {
+    const auto gpus = enumerateGpuDevices();
+    if (gpu_index >= 0 && gpu_index < static_cast<int>(gpus.size())) {
+        return gpus[static_cast<std::size_t>(gpu_index)].dedicated_memory_mb;
+    }
+
+    return 0.0;
+}
+
+GpuMemorySnapshot sampleGpuMemory(int gpu_index) {
+    GpuMemorySnapshot snap;
+    snap.dedicated_total_mb = gpuDedicatedMemoryMb(gpu_index);
+#ifdef _WIN32
+    PDH_HQUERY query = nullptr;
+    PDH_HCOUNTER dedicated_counter = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+        snap.valid = snap.dedicated_total_mb > 0.0;
+        return snap;
+    }
+
+    const wchar_t* counter_path = L"\\GPU Adapter Memory(*)\\Dedicated Usage";
+    if (PdhAddEnglishCounterW(query, counter_path, 0, &dedicated_counter) != ERROR_SUCCESS &&
+        PdhAddCounterW(query, counter_path, 0, &dedicated_counter) != ERROR_SUCCESS) {
+        PdhCloseQuery(query);
+        snap.valid = snap.dedicated_total_mb > 0.0;
+        return snap;
+    }
+
+    if (PdhCollectQueryData(query) == ERROR_SUCCESS) {
+        DWORD buffer_size = 0;
+        DWORD item_count = 0;
+        PDH_STATUS status = PdhGetFormattedCounterArrayW(
+            dedicated_counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, nullptr);
+        if (status == PDH_MORE_DATA && buffer_size > 0 && item_count > 0) {
+            std::vector<unsigned char> buffer(buffer_size);
+            auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+            status = PdhGetFormattedCounterArrayW(dedicated_counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, items);
+            if (status == ERROR_SUCCESS) {
+                double total_bytes = 0.0;
+                for (DWORD i = 0; i < item_count; ++i) {
+                    if (items[i].FmtValue.CStatus == ERROR_SUCCESS) {
+                        total_bytes += std::max(0.0, items[i].FmtValue.doubleValue);
+                    }
+                }
+                snap.dedicated_used_mb = total_bytes / (1024.0 * 1024.0);
+            }
+        }
+    }
+
+    PdhCloseQuery(query);
+#endif
+    snap.valid = snap.dedicated_total_mb > 0.0;
+    return snap;
 }
 
 std::string fitText(const std::string& text, std::size_t width) {
@@ -507,6 +582,8 @@ void parseArgs(int argc, char** argv, Options& opt) {
             readInt(opt.probe_mb);
         } else if (a == "--theoretical-gbs" && i + 1 < argc) {
             opt.theoretical_bandwidth_gbs = std::max(1.0, std::atof(argv[++i]));
+        } else if (a == "--gpu-vram-gbs" && i + 1 < argc) {
+            opt.gpu_vram_bandwidth_gbs = std::max(1.0, std::atof(argv[++i]));
         } else if (a == "--device" && i + 1 < argc) {
             const std::string value = argv[++i];
             if (value == "cpu" || value == "gpu") {
@@ -541,6 +618,7 @@ void parseArgs(int argc, char** argv, Options& opt) {
                 << "  --top N            Show top N functions by bytes/window (default: 10)\n"
                 << "  --probe-mb N       Total memory used by the system bandwidth probe (default: 256)\n"
                 << "  --theoretical-gbs N  Theoretical RAM bandwidth used as 100% in system mode (default: 51.2)\n"
+                << "  --gpu-vram-gbs N   Theoretical GPU VRAM bandwidth to show in system mode (default: 456.0)\n"
                 << "  --device cpu|gpu   Select target device label (default: cpu)\n"
                 << "  --gpu-index N      Select GPU adapter index when --device gpu is used (default: 0)\n"
                 << "  --list-devices     Show CPU/GPU devices and exit\n"
@@ -732,14 +810,20 @@ void printSnapshot(const mbm::WindowSnapshot& snap,
 }
 
 void printSystemSnapshot(const std::string& target_device,
+                         const std::string& gpu_label,
                          const SystemMemorySnapshot& mem,
+                         const GpuMemorySnapshot& gpu_mem,
                          const BandwidthProbeSnapshot& bw,
                          int workers,
                          int probe_mb,
                          double theoretical_bandwidth_gbs,
+                         double gpu_vram_bandwidth_gbs,
                          double window_sec) {
     const double theoretical_mbs = theoretical_bandwidth_gbs * 1024.0;
+    const double gpu_vram_mbs = gpu_vram_bandwidth_gbs * 1024.0;
     const double bandwidth_ratio = (theoretical_mbs <= 0.0) ? 0.0 : bw.bandwidth_mbs / theoretical_mbs;
+    const double gpu_memory_ratio =
+        (gpu_mem.dedicated_total_mb <= 0.0) ? 0.0 : gpu_mem.dedicated_used_mb / gpu_mem.dedicated_total_mb;
 
     printTopLine("MBM system memory monitor", "device " + target_device);
     std::cout << "Window: " << std::fixed << std::setprecision(0) << window_sec * 1000.0 << " ms"
@@ -771,6 +855,21 @@ void printSystemSnapshot(const std::string& target_device,
               << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
               << "  " << std::setw(4) << formatPercent(bandwidth_ratio)
               << " measured read+write\n\n";
+    if (gpu_mem.valid) {
+        std::cout << " VRAM [" << usageBar(gpu_mem.dedicated_used_mb, gpu_mem.dedicated_total_mb, 40) << "] "
+                  << std::right << std::setw(10) << formatMegabytes(gpu_mem.dedicated_used_mb)
+                  << " / " << std::setw(10) << formatMegabytes(gpu_mem.dedicated_total_mb)
+                  << "  " << std::setw(4) << formatPercent(gpu_memory_ratio)
+                  << " dedicated usage\n";
+    } else {
+        std::cout << " VRAM [" << usageBar(0.0, 1.0, 40) << "] "
+                  << std::right << std::setw(10) << "--"
+                  << " / " << std::setw(10) << "--"
+                  << "  usage unavailable\n";
+    }
+    std::cout << " VBW  [" << usageBar(gpu_vram_mbs, gpu_vram_mbs, 40) << "] "
+              << std::right << std::setw(10) << formatMegabytesPerSecond(gpu_vram_mbs)
+              << " theoretical " << fitText(gpu_label, 28) << "\n\n";
 
     std::cout << "\x1b[7m"
               << std::left << std::setw(24) << "Metric"
@@ -786,6 +885,21 @@ void printSystemSnapshot(const std::string& target_device,
     std::cout << std::left << std::setw(24) << "bandwidth_utilization"
               << std::right << std::setw(18) << formatPercent(bandwidth_ratio)
               << "  measured / theoretical\n";
+    std::cout << std::left << std::setw(24) << "gpu_vram_bandwidth"
+              << std::right << std::setw(18) << formatMegabytesPerSecond(gpu_vram_mbs)
+              << "  theoretical " << fitText(gpu_label, 24) << "\n";
+    std::cout << std::left << std::setw(24) << "gpu_vram_used"
+              << std::right << std::setw(18)
+              << (gpu_mem.valid ? formatMegabytes(gpu_mem.dedicated_used_mb) : "--")
+              << "  dedicated usage\n";
+    std::cout << std::left << std::setw(24) << "gpu_vram_total"
+              << std::right << std::setw(18)
+              << (gpu_mem.valid ? formatMegabytes(gpu_mem.dedicated_total_mb) : "--")
+              << "  dedicated capacity\n";
+    std::cout << std::left << std::setw(24) << "gpu_vram_utilization"
+              << std::right << std::setw(18)
+              << (gpu_mem.valid ? formatPercent(gpu_memory_ratio) : "--")
+              << "  used / dedicated\n";
     std::cout << std::left << std::setw(24) << "bandwidth_bytes"
               << std::right << std::setw(18) << formatBytes(bw.bytes)
               << "  touched by probe\n";
@@ -864,6 +978,7 @@ int main(int argc, char** argv) {
     }
 
     const std::string selected_device = targetDeviceLabel(opt);
+    const std::string selected_gpu = gpuDeviceLabel(opt.gpu_index);
 
 #ifdef _WIN32
     SetConsoleCtrlHandler(HandleCtrl, TRUE);
@@ -920,10 +1035,20 @@ int main(int argc, char** argv) {
             const auto bw = measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms);
             const auto now = Clock::now();
             const auto mem = sampleSystemMemory();
+            const auto gpu_mem = sampleGpuMemory(opt.gpu_index);
             const double sec = std::max(1e-9, std::chrono::duration_cast<std::chrono::duration<double>>(now - last_sample_at).count());
 
             redrawConsoleView();
-            printSystemSnapshot(selected_device, mem, bw, opt.workers, opt.probe_mb, opt.theoretical_bandwidth_gbs, sec);
+            printSystemSnapshot(selected_device,
+                                selected_gpu,
+                                mem,
+                                gpu_mem,
+                                bw,
+                                opt.workers,
+                                opt.probe_mb,
+                                opt.theoretical_bandwidth_gbs,
+                                opt.gpu_vram_bandwidth_gbs,
+                                sec);
             last_sample_at = now;
 
             if (opt.duration_sec > 0) {

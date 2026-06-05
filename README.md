@@ -138,6 +138,12 @@ Override the theoretical RAM bandwidth used as the 100% scale:
 ./build/Release/mbm_cli.exe --theoretical-gbs 51.2
 ```
 
+Override the displayed theoretical GPU VRAM bandwidth:
+
+```powershell
+./build/Release/mbm_cli.exe --gpu-vram-gbs 456
+```
+
 Demo mode (generates AI-like workloads and profiles them):
 
 ```powershell
@@ -216,4 +222,6 @@ Window: 675 ms   Workers: 6   Probe: 256 MB   Max: 51.2 GB/s   Sample: 174 ms
  Free [||||||||||||||||||||||                  ]    17.5 GB available
  Cmit [|||||||||||||||||||                     ]    23.7 GB /    50.9 GB committed
  BW   [|||||||||||||||||||||||||               ]    32.6 GB/s /  51.2 GB/s   64% measured read+write
+ VRAM [|||                                     ]     1.7 GB /    23.8 GB    7% dedicated usage
+ VBW  [||||||||||||||||||||||||||||||||||||||||]   456.0 GB/s theoretical GPU[0] Intel(R) Arc(TM) Pro~
 ```
