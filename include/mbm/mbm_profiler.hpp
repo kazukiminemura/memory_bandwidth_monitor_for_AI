@@ -44,9 +44,6 @@ public:
 
     ScopeGuard(const ScopeGuard&) = delete;
     ScopeGuard& operator=(const ScopeGuard&) = delete;
-
-private:
-    bool active_{false};
 };
 
 } // namespace mbm

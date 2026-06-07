@@ -11,12 +11,13 @@
 #include <cwchar>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,7 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+constexpr double bytes_per_mb{1024.0 * 1024.0};
 
 enum class RunMode {
     System,
@@ -90,17 +92,41 @@ struct GpuDevice {
     double dedicated_memory_mb{0.0};
 };
 
-struct ProcessTarget {
-    unsigned long pid{0};
-    std::string name;
-#ifdef _WIN32
-    HANDLE handle{nullptr};
-#endif
-};
-
 std::atomic<bool> g_running{true};
 
 #ifdef _WIN32
+template <typename T>
+struct ComReleaser {
+    void operator()(T* ptr) const {
+        if (ptr != nullptr) {
+            ptr->Release();
+        }
+    }
+};
+
+template <typename T>
+using ComPtr = std::unique_ptr<T, ComReleaser<T>>;
+
+struct HandleCloser {
+    void operator()(HANDLE handle) const {
+        if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+    }
+};
+
+using UniqueHandle = std::unique_ptr<std::remove_pointer_t<HANDLE>, HandleCloser>;
+
+struct PdhQueryCloser {
+    void operator()(PDH_HQUERY query) const {
+        if (query != nullptr) {
+            PdhCloseQuery(query);
+        }
+    }
+};
+
+using UniquePdhQuery = std::unique_ptr<std::remove_pointer_t<PDH_HQUERY>, PdhQueryCloser>;
+
 BOOL WINAPI HandleCtrl(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT) {
         g_running.store(false);
@@ -109,6 +135,14 @@ BOOL WINAPI HandleCtrl(DWORD signal) {
     return FALSE;
 }
 #endif
+
+struct ProcessTarget {
+    unsigned long pid{0};
+    std::string name;
+#ifdef _WIN32
+    UniqueHandle handle;
+#endif
+};
 
 void enableVirtualTerminalOutput() {
 #ifdef _WIN32
@@ -152,17 +186,14 @@ void finishConsoleRedraw() {
     std::cout << "\x1b[J" << std::flush;
 }
 
-double toMb(std::uint64_t bytes) {
-    return bytes / (1024.0 * 1024.0);
-}
-
-double bytesToMb(double bytes) {
-    return bytes / (1024.0 * 1024.0);
+template <typename T>
+double toDouble(T value) {
+    return static_cast<double>(value);
 }
 
 template <typename T>
-double numericToDouble(T value) {
-    return value / 1.0;
+double bytesToMb(T bytes) {
+    return toDouble(bytes) / bytes_per_mb;
 }
 
 #ifdef _WIN32
@@ -204,26 +235,23 @@ bool equalsIgnoreCase(const wchar_t* lhs, const std::wstring& rhs) {
 std::vector<GpuDevice> enumerateGpuDevices() {
     std::vector<GpuDevice> devices;
 #ifdef _WIN32
-    IDXGIFactory1* factory{nullptr};
-    if (CreateDXGIFactory1(IID_PPV_ARGS(&factory)) != S_OK || factory == nullptr) {
+    IDXGIFactory1* raw_factory{nullptr};
+    if (CreateDXGIFactory1(IID_PPV_ARGS(&raw_factory)) != S_OK || raw_factory == nullptr) {
         return devices;
     }
+    ComPtr<IDXGIFactory1> factory{raw_factory};
 
-    IDXGIAdapter1* adapter{nullptr};
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+    for (UINT i = 0;; ++i) {
+        IDXGIAdapter1* raw_adapter{nullptr};
+        if (factory->EnumAdapters1(i, &raw_adapter) == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        ComPtr<IDXGIAdapter1> adapter{raw_adapter};
         DXGI_ADAPTER_DESC1 desc{};
         if (adapter->GetDesc1(&desc) == S_OK && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-            GpuDevice device{};
-            device.index = devices.size();
-            device.name = narrow(desc.Description);
-            device.dedicated_memory_mb = desc.DedicatedVideoMemory / (1024.0 * 1024.0);
-            devices.push_back(std::move(device));
+            devices.push_back({devices.size(), narrow(desc.Description), bytesToMb(desc.DedicatedVideoMemory)});
         }
-        adapter->Release();
-        adapter = nullptr;
     }
-
-    factory->Release();
 #endif
     return devices;
 }
@@ -263,22 +291,22 @@ GpuMemorySnapshot sampleGpuMemory(std::size_t gpu_index) {
     GpuMemorySnapshot snap{};
     snap.dedicated_total_mb = gpuDedicatedMemoryMb(gpu_index);
 #ifdef _WIN32
-    PDH_HQUERY query{nullptr};
+    PDH_HQUERY raw_query{nullptr};
     PDH_HCOUNTER dedicated_counter{nullptr};
-    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+    if (PdhOpenQueryW(nullptr, 0, &raw_query) != ERROR_SUCCESS) {
         snap.valid = snap.dedicated_total_mb > 0.0;
         return snap;
     }
+    UniquePdhQuery query{raw_query};
 
     const wchar_t* counter_path{L"\\GPU Adapter Memory(*)\\Dedicated Usage"};
-    if (PdhAddEnglishCounterW(query, counter_path, 0, &dedicated_counter) != ERROR_SUCCESS &&
-        PdhAddCounterW(query, counter_path, 0, &dedicated_counter) != ERROR_SUCCESS) {
-        PdhCloseQuery(query);
+    if (PdhAddEnglishCounterW(query.get(), counter_path, 0, &dedicated_counter) != ERROR_SUCCESS &&
+        PdhAddCounterW(query.get(), counter_path, 0, &dedicated_counter) != ERROR_SUCCESS) {
         snap.valid = snap.dedicated_total_mb > 0.0;
         return snap;
     }
 
-    if (PdhCollectQueryData(query) == ERROR_SUCCESS) {
+    if (PdhCollectQueryData(query.get()) == ERROR_SUCCESS) {
         DWORD buffer_size{0};
         DWORD item_count{0};
         PDH_STATUS status{PdhGetFormattedCounterArrayW(
@@ -294,12 +322,10 @@ GpuMemorySnapshot sampleGpuMemory(std::size_t gpu_index) {
                         total_bytes += std::max(0.0, items[i].FmtValue.doubleValue);
                     }
                 }
-                snap.dedicated_used_mb = total_bytes / (1024.0 * 1024.0);
+                snap.dedicated_used_mb = bytesToMb(total_bytes);
             }
         }
     }
-
-    PdhCloseQuery(query);
 #endif
     snap.valid = snap.dedicated_total_mb > 0.0;
     return snap;
@@ -413,48 +439,26 @@ bool parseValue(const char* text, T& out) {
     return result.ec == std::errc{} && result.ptr == last;
 }
 
-void readPositiveInt(int argc, char** argv, int& i, int& out) {
+template <typename T, typename Clamp>
+void readArg(int argc, char** argv, int& i, T& out, Clamp clamp) {
     if (i + 1 >= argc) {
         return;
     }
 
-    int value{out};
+    T value{out};
     if (parseValue(argv[++i], value)) {
-        out = std::max(1, value);
+        out = clamp(value);
     }
 }
 
-void readPositiveSize(int argc, char** argv, int& i, std::size_t& out) {
-    if (i + 1 >= argc) {
-        return;
-    }
-
-    std::size_t value{out};
-    if (parseValue(argv[++i], value)) {
-        out = std::max<std::size_t>(1, value);
-    }
+template <typename T>
+void readPositive(int argc, char** argv, int& i, T& out) {
+    readArg(argc, argv, i, out, [](T value) { return std::max<T>(1, value); });
 }
 
-void readNonNegativeSize(int argc, char** argv, int& i, std::size_t& out) {
-    if (i + 1 >= argc) {
-        return;
-    }
-
-    std::size_t value{out};
-    if (parseValue(argv[++i], value)) {
-        out = value;
-    }
-}
-
-void readPositiveDouble(int argc, char** argv, int& i, double& out) {
-    if (i + 1 >= argc) {
-        return;
-    }
-
-    double value{out};
-    if (parseValue(argv[++i], value)) {
-        out = std::max(1.0, value);
-    }
+template <typename T>
+void readValue(int argc, char** argv, int& i, T& out) {
+    readArg(argc, argv, i, out, [](T value) { return value; });
 }
 
 ProcMemorySnapshot sampleProcessMemory(
@@ -512,33 +516,29 @@ BandwidthProbeSnapshot measureSystemMemoryBandwidth(std::size_t workers, std::si
     std::atomic<std::uint64_t> checksum_sink{0};
     const auto started{Clock::now()};
     const auto deadline{started + run_for};
-    std::vector<std::thread> threads;
-    threads.reserve(worker_count);
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(worker_count);
 
-    for (std::size_t worker{0}; worker < worker_count; ++worker) {
-        threads.emplace_back([bytes_per_worker, deadline, &touched_bytes, &checksum_sink, worker]() {
-            const std::size_t words{std::max<std::size_t>(1024, bytes_per_worker / sizeof(std::uint64_t))};
-            std::vector<std::uint64_t> buffer(words, 0x9e3779b97f4a7c15ULL + worker);
-            std::uint64_t local_bytes{0};
-            std::uint64_t local_checksum{0};
+        for (std::size_t worker{0}; worker < worker_count; ++worker) {
+            threads.emplace_back([bytes_per_worker, deadline, &touched_bytes, &checksum_sink, worker]() {
+                const std::size_t words{std::max<std::size_t>(1024, bytes_per_worker / sizeof(std::uint64_t))};
+                std::vector<std::uint64_t> buffer(words, 0x9e3779b97f4a7c15ULL + worker);
+                std::uint64_t local_bytes{0};
+                std::uint64_t local_checksum{0};
 
-            while (Clock::now() < deadline && g_running.load(std::memory_order_relaxed)) {
-                for (std::size_t i{0}; i < buffer.size(); ++i) {
-                    const std::uint64_t next{buffer[i] + 1U};
-                    buffer[i] = next;
-                    local_checksum += next;
+                while (Clock::now() < deadline && g_running.load(std::memory_order_relaxed)) {
+                    for (std::size_t i{0}; i < buffer.size(); ++i) {
+                        const std::uint64_t next{buffer[i] + 1U};
+                        buffer[i] = next;
+                        local_checksum += next;
+                    }
+                    local_bytes += buffer.size() * sizeof(std::uint64_t) * 2ULL;
                 }
-                local_bytes += buffer.size() * sizeof(std::uint64_t) * 2ULL;
-            }
 
-            touched_bytes.fetch_add(local_bytes, std::memory_order_relaxed);
-            checksum_sink.fetch_xor(local_checksum, std::memory_order_relaxed);
-        });
-    }
-
-    for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
+                touched_bytes.fetch_add(local_bytes, std::memory_order_relaxed);
+                checksum_sink.fetch_xor(local_checksum, std::memory_order_relaxed);
+            });
         }
     }
 
@@ -547,7 +547,7 @@ BandwidthProbeSnapshot measureSystemMemoryBandwidth(std::size_t workers, std::si
     BandwidthProbeSnapshot snap{};
     snap.bytes = touched_bytes.load(std::memory_order_relaxed);
     snap.seconds = sec;
-    snap.bandwidth_mbs = toMb(snap.bytes) / sec;
+    snap.bandwidth_mbs = bytesToMb(snap.bytes) / sec;
     return snap;
 }
 
@@ -573,24 +573,23 @@ unsigned long findProcessIdByName(const std::string& process_name) {
         return 0;
     }
 
-    HANDLE snapshot{CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)};
-    if (snapshot == INVALID_HANDLE_VALUE) {
+    UniqueHandle snapshot{CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)};
+    if (snapshot.get() == INVALID_HANDLE_VALUE) {
         return 0;
     }
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     unsigned long pid{0};
-    if (Process32FirstW(snapshot, &entry) != FALSE) {
+    if (Process32FirstW(snapshot.get(), &entry) != FALSE) {
         do {
             if (equalsIgnoreCase(entry.szExeFile, wanted)) {
                 pid = entry.th32ProcessID;
                 break;
             }
-        } while (Process32NextW(snapshot, &entry) != FALSE);
+        } while (Process32NextW(snapshot.get(), &entry) != FALSE);
     }
 
-    CloseHandle(snapshot);
     return pid;
 }
 
@@ -605,13 +604,13 @@ ProcessTarget openProcessTarget(const Options& opt) {
         }
     }
 
-    target.handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, target.pid);
+    target.handle.reset(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, target.pid));
     if (target.handle == nullptr) {
         std::cerr << "Could not open process PID " << target.pid << " (error " << GetLastError() << ")\n";
         std::exit(1);
     }
 
-    target.name = processNameFromHandle(target.handle);
+    target.name = processNameFromHandle(target.handle.get());
     if (target.name.empty()) {
         target.name = opt.process_name.empty() ? "pid " + std::to_string(target.pid) : opt.process_name;
     }
@@ -624,19 +623,19 @@ void parseArgs(int argc, char** argv, Options& opt) {
         const std::string a{argv[i]};
 
         if (a == "--interval-ms") {
-            readPositiveInt(argc, argv, i, opt.interval_ms);
+            readPositive(argc, argv, i, opt.interval_ms);
         } else if (a == "--workers") {
-            readPositiveSize(argc, argv, i, opt.workers);
+            readPositive(argc, argv, i, opt.workers);
         } else if (a == "--duration-sec") {
-            readPositiveInt(argc, argv, i, opt.duration_sec);
+            readPositive(argc, argv, i, opt.duration_sec);
         } else if (a == "--top") {
-            readPositiveSize(argc, argv, i, opt.top);
+            readPositive(argc, argv, i, opt.top);
         } else if (a == "--probe-mb") {
-            readPositiveSize(argc, argv, i, opt.probe_mb);
+            readPositive(argc, argv, i, opt.probe_mb);
         } else if (a == "--theoretical-gbs" && i + 1 < argc) {
-            readPositiveDouble(argc, argv, i, opt.theoretical_bandwidth_gbs);
+            readPositive(argc, argv, i, opt.theoretical_bandwidth_gbs);
         } else if (a == "--gpu-vram-gbs" && i + 1 < argc) {
-            readPositiveDouble(argc, argv, i, opt.gpu_vram_bandwidth_gbs);
+            readPositive(argc, argv, i, opt.gpu_vram_bandwidth_gbs);
         } else if (a == "--device" && i + 1 < argc) {
             const std::string value{argv[++i]};
             if (value == "cpu" || value == "gpu") {
@@ -646,7 +645,7 @@ void parseArgs(int argc, char** argv, Options& opt) {
                 std::exit(1);
             }
         } else if (a == "--gpu-index") {
-            readNonNegativeSize(argc, argv, i, opt.gpu_index);
+            readValue(argc, argv, i, opt.gpu_index);
             opt.device = "gpu";
         } else if (a == "--list-devices") {
             opt.list_devices = true;
@@ -714,7 +713,7 @@ void simulateLayerNorm(std::vector<float>& x, std::vector<float>& y) {
         sum += sample;
         sum2 += sample * sample;
     }
-    const double count{numericToDouble(n)};
+    const double count{toDouble(n)};
     const double mean{sum / count};
     const double var{std::max(1e-12, sum2 / count - mean * mean)};
     const double inv_std{1.0 / std::sqrt(var + 1e-5)};
@@ -815,8 +814,8 @@ void printSnapshot(const mbm::WindowSnapshot& snap,
         total_bytes += r.bytes;
     }
 
-    const double total_mbs{toMb(total_bytes) / sec};
-    const double page_fault_delta{numericToDouble(now_mem.page_faults - prev_mem.page_faults)};
+    const double total_mbs{bytesToMb(total_bytes) / sec};
+    const double page_fault_delta{toDouble(now_mem.page_faults - prev_mem.page_faults)};
     const double page_fault_rate{page_fault_delta / sec};
 
     printTopLine("MBM live monitor", "device " + target_device);
@@ -845,10 +844,10 @@ void printSnapshot(const mbm::WindowSnapshot& snap,
     const std::size_t lim{std::min(rows.size(), std::max<std::size_t>(1, top_n))};
     for (std::size_t i{0}; i < lim; ++i) {
         const auto& r = rows[i];
-        const double mb{toMb(r.bytes)};
+        const double mb{bytesToMb(r.bytes)};
         const double mbs{mb / sec};
-        const double total_ns{numericToDouble(r.total_ns)};
-        const double calls{numericToDouble(r.calls)};
+        const double total_ns{toDouble(r.total_ns)};
+        const double calls{toDouble(r.calls)};
         const double avg_us{(r.calls == 0) ? 0.0 : total_ns / calls / 1000.0};
 
         std::cout << std::left << std::setw(4) << (i + 1)
@@ -1048,21 +1047,21 @@ int main(int argc, char** argv) {
         LiveConsole live_console;
         const auto started_at{Clock::now()};
         auto last_sample_at{Clock::now()};
-        auto prev_mem{sampleProcessMemory(target.handle)};
+        auto prev_mem{sampleProcessMemory(target.handle.get())};
 
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(opt.interval_ms));
 
             const auto now{Clock::now()};
             const double sec{std::max(1e-9, std::chrono::duration_cast<std::chrono::duration<double>>(now - last_sample_at).count())};
-            const auto now_mem{sampleProcessMemory(target.handle)};
+            const auto now_mem{sampleProcessMemory(target.handle.get())};
             redrawConsoleView();
             printExternalProcessSnapshot(target, selected_device, now_mem, prev_mem, sec);
             prev_mem = now_mem;
             last_sample_at = now;
 
             DWORD exit_code{STILL_ACTIVE};
-            if (GetExitCodeProcess(target.handle, &exit_code) == 0 || exit_code != STILL_ACTIVE) {
+            if (GetExitCodeProcess(target.handle.get(), &exit_code) == 0 || exit_code != STILL_ACTIVE) {
                 g_running.store(false);
             }
 
@@ -1074,7 +1073,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        CloseHandle(target.handle);
         return 0;
 #else
         std::cerr << "External process monitoring is currently implemented on Windows only.\n";
@@ -1120,7 +1118,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::vector<std::thread> workers;
+    std::vector<std::jthread> workers;
     if (opt.mode == RunMode::Demo) {
         workers.reserve(opt.workers);
         for (std::size_t i{0}; i < opt.workers; ++i) {
@@ -1145,12 +1143,6 @@ int main(int argc, char** argv) {
             if (elapsed >= opt.duration_sec) {
                 g_running.store(false);
             }
-        }
-    }
-
-    for (auto& t : workers) {
-        if (t.joinable()) {
-            t.join();
         }
     }
 

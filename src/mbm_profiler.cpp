@@ -45,10 +45,7 @@ Profiler::Profiler() = default;
 Profiler::~Profiler() = default;
 
 void Profiler::enterScope(const char* function_name) {
-    ScopeFrame frame{};
-    frame.name = function_name;
-    frame.start = Clock::now();
-    g_scope_stack.push_back(frame);
+    g_scope_stack.push_back({.name = function_name, .start = Clock::now()});
 }
 
 void Profiler::addBytes(std::uint64_t bytes) {
@@ -63,14 +60,14 @@ void Profiler::leaveScope() {
         return;
     }
 
-    ScopeFrame frame{g_scope_stack.back()};
+    auto frame{g_scope_stack.back()};
     g_scope_stack.pop_back();
 
     const auto end{Clock::now()};
     const auto elapsed_ns{std::chrono::duration_cast<std::chrono::nanoseconds>(end - frame.start).count()};
 
     auto& state{impl()};
-    std::lock_guard<std::mutex> lock(state.mutex);
+    std::scoped_lock lock{state.mutex};
     auto& stat{state.window_stats[frame.name]};
     stat.calls += 1;
     stat.bytes += frame.bytes;
@@ -80,18 +77,13 @@ void Profiler::leaveScope() {
 WindowSnapshot Profiler::consumeWindow() {
     WindowSnapshot snapshot{};
     auto& state{impl()};
-    std::lock_guard<std::mutex> lock(state.mutex);
+    std::scoped_lock lock{state.mutex};
 
     snapshot.from = state.window_start;
     snapshot.to = Clock::now();
     snapshot.functions.reserve(state.window_stats.size());
     for (const auto& [name, stat] : state.window_stats) {
-        FunctionWindowStat out{};
-        out.name = name;
-        out.calls = stat.calls;
-        out.bytes = stat.bytes;
-        out.total_ns = stat.total_ns;
-        snapshot.functions.push_back(std::move(out));
+        snapshot.functions.push_back({name, stat.calls, stat.bytes, stat.total_ns});
     }
 
     state.window_stats.clear();
@@ -99,14 +91,12 @@ WindowSnapshot Profiler::consumeWindow() {
     return snapshot;
 }
 
-ScopeGuard::ScopeGuard(const char* function_name) : active_{true} {
+ScopeGuard::ScopeGuard(const char* function_name) {
     Profiler::instance().enterScope(function_name);
 }
 
 ScopeGuard::~ScopeGuard() {
-    if (active_) {
-        Profiler::instance().leaveScope();
-    }
+    Profiler::instance().leaveScope();
 }
 
 } // namespace mbm
