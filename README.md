@@ -6,7 +6,7 @@ A real-time CLI tool that estimates memory bandwidth and shows which functions a
 
 - System mode (default):
   - System physical memory used/free/committed
-  - Measured read+write memory bandwidth from a short system memory probe
+  - Measured read and write memory bandwidth from a short system memory probe
 - Demo/instrumentation mode:
   - Real-time throughput view (windowed MB/s)
   - Per-function impact table:
@@ -15,8 +15,8 @@ A real-time CLI tool that estimates memory bandwidth and shows which functions a
   - Bytes touched in interval
   - Estimated MB/s contribution
   - Average latency per call
-- External process mode:
-  - Monitor another process by PID or executable name
+- Process target overlay:
+  - Add another process by PID or executable name to the default system view
   - Working set
   - Private bytes
   - Page-fault rate
@@ -169,14 +169,14 @@ Select CPU or GPU target:
 ./build/Release/mbm_cli.exe --device gpu --gpu-index 0
 ```
 
-Monitor another process:
+Add another process to the default system monitor:
 
 ```powershell
 ./build/Release/mbm_cli.exe --pid 1234
 ./build/Release/mbm_cli.exe --process-name python.exe
 ```
 
-External process mode can be combined with device selection:
+The process overlay can be combined with device selection:
 
 ```powershell
 ./build/Release/mbm_cli.exe --process-name python.exe --device gpu --gpu-index 0
@@ -206,10 +206,10 @@ Notes:
 
 ## Limitations
 
-- Default system mode measures read+write bandwidth with a short memory probe, not direct DRAM hardware counters.
+- Default system mode measures read and write bandwidth with a short memory probe, not direct DRAM hardware counters.
 - Demo mode is function-level estimated bandwidth, not direct DRAM hardware counter sampling.
 - Accuracy depends on correct byte annotations in hot paths.
-- `--pid` and `--process-name` monitor process memory state only. They do not yet report CPU/GPU memory bandwidth for that process.
+- `--pid` and `--process-name` add process memory state only. The read/write bandwidth remains the system probe, not per-process bandwidth.
 - GPU selection currently identifies the target adapter in the CLI output; bandwidth values still come from `MBM_ADD_BYTES` annotations, not GPU hardware counters.
 - For CPU-uncore hardware counters, platform-specific tools (for example Intel PCM) are needed.
 
@@ -221,7 +221,8 @@ Window: 675 ms   Workers: 6   Probe: 256 MB   Max: 51.2 GB/s   Sample: 174 ms
  RAM  [||||||||||||||||||                      ]    14.2 GB /    31.7 GB  load 44%
  Free [||||||||||||||||||||||                  ]    17.5 GB available
  Cmit [|||||||||||||||||||                     ]    23.7 GB /    50.9 GB committed
- BW   [|||||||||||||||||||||||||               ]    32.6 GB/s /  51.2 GB/s   64% measured read+write
+ Read [||||||||||||                            ]    16.3 GB/s /  51.2 GB/s   32% measured read
+Write [||||||||||||                            ]    16.3 GB/s /  51.2 GB/s   32% measured write
  VRAM [|||                                     ]     1.7 GB /    23.8 GB    7% dedicated usage
  VBW  [||||||||||||||||||||||||||||||||||||||||]   456.0 GB/s theoretical GPU[0] Intel(R) Arc(TM) Pro~
 ```

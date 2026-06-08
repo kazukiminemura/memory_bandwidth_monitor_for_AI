@@ -75,9 +75,12 @@ struct SystemMemorySnapshot {
 };
 
 struct BandwidthProbeSnapshot {
-    double bandwidth_mbs{0.0};
+    double read_bandwidth_mbs{0.0};
+    double write_bandwidth_mbs{0.0};
+    double total_bandwidth_mbs{0.0};
     double seconds{0.0};
-    std::uint64_t bytes{0};
+    std::uint64_t read_bytes{0};
+    std::uint64_t write_bytes{0};
 };
 
 struct GpuMemorySnapshot {
@@ -512,42 +515,72 @@ BandwidthProbeSnapshot measureSystemMemoryBandwidth(std::size_t workers, std::si
         std::max<std::size_t>(4ULL * 1024ULL * 1024ULL, total_bytes / worker_count)};
     const auto run_for{std::chrono::milliseconds(std::clamp(interval_ms / 3, 80, 250))};
 
-    std::atomic<std::uint64_t> touched_bytes{0};
+    std::atomic<std::uint64_t> read_bytes{0};
+    std::atomic<std::uint64_t> write_bytes{0};
     std::atomic<std::uint64_t> checksum_sink{0};
     const auto started{Clock::now()};
-    const auto deadline{started + run_for};
-    {
-        std::vector<std::jthread> threads;
-        threads.reserve(worker_count);
 
-        for (std::size_t worker{0}; worker < worker_count; ++worker) {
-            threads.emplace_back([bytes_per_worker, deadline, &touched_bytes, &checksum_sink, worker]() {
-                const std::size_t words{std::max<std::size_t>(1024, bytes_per_worker / sizeof(std::uint64_t))};
-                std::vector<std::uint64_t> buffer(words, 0x9e3779b97f4a7c15ULL + worker);
-                std::uint64_t local_bytes{0};
-                std::uint64_t local_checksum{0};
+    auto run_probe_phase = [&](bool write_phase) {
+        const auto deadline{Clock::now() + run_for};
+        const auto phase_started{Clock::now()};
+        {
+            std::vector<std::jthread> threads;
+            threads.reserve(worker_count);
 
-                while (Clock::now() < deadline && g_running.load(std::memory_order_relaxed)) {
-                    for (std::size_t i{0}; i < buffer.size(); ++i) {
-                        const std::uint64_t next{buffer[i] + 1U};
-                        buffer[i] = next;
-                        local_checksum += next;
+            for (std::size_t worker{0}; worker < worker_count; ++worker) {
+                threads.emplace_back([bytes_per_worker,
+                                      deadline,
+                                      &read_bytes,
+                                      &write_bytes,
+                                      &checksum_sink,
+                                      worker,
+                                      write_phase]() {
+                    const std::size_t words{std::max<std::size_t>(1024, bytes_per_worker / sizeof(std::uint64_t))};
+                    std::vector<std::uint64_t> buffer(words, 0x9e3779b97f4a7c15ULL + worker);
+                    volatile std::uint64_t* memory{buffer.data()};
+                    std::uint64_t local_bytes{0};
+                    std::uint64_t local_checksum{0};
+                    std::uint64_t value{0xbf58476d1ce4e5b9ULL + worker};
+
+                    while (Clock::now() < deadline && g_running.load(std::memory_order_relaxed)) {
+                        if (write_phase) {
+                            for (std::size_t i{0}; i < buffer.size(); ++i) {
+                                value += 0x9e3779b97f4a7c15ULL;
+                                memory[i] = value;
+                            }
+                        } else {
+                            for (std::size_t i{0}; i < buffer.size(); ++i) {
+                                local_checksum += memory[i];
+                            }
+                        }
+                        local_bytes += buffer.size() * sizeof(std::uint64_t);
                     }
-                    local_bytes += buffer.size() * sizeof(std::uint64_t) * 2ULL;
-                }
 
-                touched_bytes.fetch_add(local_bytes, std::memory_order_relaxed);
-                checksum_sink.fetch_xor(local_checksum, std::memory_order_relaxed);
-            });
+                    if (write_phase) {
+                        write_bytes.fetch_add(local_bytes, std::memory_order_relaxed);
+                        checksum_sink.fetch_xor(value, std::memory_order_relaxed);
+                    } else {
+                        read_bytes.fetch_add(local_bytes, std::memory_order_relaxed);
+                        checksum_sink.fetch_xor(local_checksum, std::memory_order_relaxed);
+                    }
+                });
+            }
         }
-    }
+        return std::max(1e-9, std::chrono::duration_cast<std::chrono::duration<double>>(Clock::now() - phase_started).count());
+    };
+
+    const double read_sec{run_probe_phase(false)};
+    const double write_sec{run_probe_phase(true)};
 
     const auto ended{Clock::now()};
     const double sec{std::max(1e-9, std::chrono::duration_cast<std::chrono::duration<double>>(ended - started).count())};
     BandwidthProbeSnapshot snap{};
-    snap.bytes = touched_bytes.load(std::memory_order_relaxed);
+    snap.read_bytes = read_bytes.load(std::memory_order_relaxed);
+    snap.write_bytes = write_bytes.load(std::memory_order_relaxed);
     snap.seconds = sec;
-    snap.bandwidth_mbs = bytesToMb(snap.bytes) / sec;
+    snap.read_bandwidth_mbs = bytesToMb(snap.read_bytes) / read_sec;
+    snap.write_bandwidth_mbs = bytesToMb(snap.write_bytes) / write_sec;
+    snap.total_bandwidth_mbs = snap.read_bandwidth_mbs + snap.write_bandwidth_mbs;
     return snap;
 }
 
@@ -674,8 +707,8 @@ void parseArgs(int argc, char** argv, Options& opt) {
                 << "  --device cpu|gpu   Select target device label (default: cpu)\n"
                 << "  --gpu-index N      Select GPU adapter index when --device gpu is used (default: 0)\n"
                 << "  --list-devices     Show CPU/GPU devices and exit\n"
-                << "  --pid N            Monitor another process by PID instead of demo instrumentation\n"
-                << "  --process-name EXE Monitor the first process with this executable name\n"
+                << "  --pid N            Add process memory stats for this PID to the system monitor\n"
+                << "  --process-name EXE Add process memory stats for this executable name\n"
                 << "  --system           Monitor system memory and probe memory bandwidth (default)\n"
                 << "  --demo             Run built-in AI-like demo workload\n"
                 << "  --no-demo          Alias for --system\n"
@@ -875,10 +908,16 @@ void printSystemSnapshot(const std::string& target_device,
                          std::size_t probe_mb,
                          double theoretical_bandwidth_gbs,
                          double gpu_vram_bandwidth_gbs,
-                         double window_sec) {
+                         double window_sec,
+                         const ProcessTarget* process_target = nullptr,
+                         const ProcMemorySnapshot* process_mem = nullptr,
+                         const ProcMemorySnapshot* prev_process_mem = nullptr,
+                         double process_window_sec = 0.0) {
     const double theoretical_mbs{theoretical_bandwidth_gbs * 1024.0};
     const double gpu_vram_mbs{gpu_vram_bandwidth_gbs * 1024.0};
-    const double bandwidth_ratio{(theoretical_mbs <= 0.0) ? 0.0 : bw.bandwidth_mbs / theoretical_mbs};
+    const double read_bandwidth_ratio{(theoretical_mbs <= 0.0) ? 0.0 : bw.read_bandwidth_mbs / theoretical_mbs};
+    const double write_bandwidth_ratio{(theoretical_mbs <= 0.0) ? 0.0 : bw.write_bandwidth_mbs / theoretical_mbs};
+    const double total_bandwidth_ratio{(theoretical_mbs <= 0.0) ? 0.0 : bw.total_bandwidth_mbs / theoretical_mbs};
     const double gpu_memory_ratio{
         (gpu_mem.dedicated_total_mb <= 0.0) ? 0.0 : gpu_mem.dedicated_used_mb / gpu_mem.dedicated_total_mb};
 
@@ -888,6 +927,10 @@ void printSystemSnapshot(const std::string& target_device,
               << "   Probe: " << formatMegabytes(probe_mb)
               << "   Max: " << formatMegabytesPerSecond(theoretical_mbs)
               << "   Sample: " << std::setprecision(0) << bw.seconds * 1000.0 << " ms\n";
+    if (process_target != nullptr) {
+        std::cout << "Target: " << process_target->name
+                  << "   PID: " << process_target->pid << "\n";
+    }
 
     if (!mem.valid) {
         std::cout << "System memory information is unavailable on this platform.\n";
@@ -907,11 +950,16 @@ void printSystemSnapshot(const std::string& target_device,
     std::cout << " Cmit [" << usageBar(mem.committed_mb, commit_scale, 40) << "] "
               << std::right << std::setw(10) << formatMegabytes(mem.committed_mb)
               << " / " << std::setw(10) << formatMegabytes(mem.commit_limit_mb) << " committed\n";
-    std::cout << " BW   [" << usageBar(bw.bandwidth_mbs, theoretical_mbs, 40) << "] "
-              << std::right << std::setw(10) << formatMegabytesPerSecond(bw.bandwidth_mbs)
+    std::cout << " Read [" << usageBar(bw.read_bandwidth_mbs, theoretical_mbs, 40) << "] "
+              << std::right << std::setw(10) << formatMegabytesPerSecond(bw.read_bandwidth_mbs)
               << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
-              << "  " << std::setw(4) << formatPercent(bandwidth_ratio)
-              << " measured read+write\n\n";
+              << "  " << std::setw(4) << formatPercent(read_bandwidth_ratio)
+              << " measured read\n";
+    std::cout << "Write [" << usageBar(bw.write_bandwidth_mbs, theoretical_mbs, 40) << "] "
+              << std::right << std::setw(10) << formatMegabytesPerSecond(bw.write_bandwidth_mbs)
+              << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
+              << "  " << std::setw(4) << formatPercent(write_bandwidth_ratio)
+              << " measured write\n\n";
     if (gpu_mem.valid) {
         std::cout << " VRAM [" << usageBar(gpu_mem.dedicated_used_mb, gpu_mem.dedicated_total_mb, 40) << "] "
                   << std::right << std::setw(10) << formatMegabytes(gpu_mem.dedicated_used_mb)
@@ -933,15 +981,21 @@ void printSystemSnapshot(const std::string& target_device,
               << std::right << std::setw(18) << "Value"
               << "  Status"
               << "\x1b[0m\n";
-    std::cout << std::left << std::setw(24) << "memory_bandwidth"
-              << std::right << std::setw(18) << formatMegabytesPerSecond(bw.bandwidth_mbs)
-              << "  probe read+write\n";
+    std::cout << std::left << std::setw(24) << "memory_read_bandwidth"
+              << std::right << std::setw(18) << formatMegabytesPerSecond(bw.read_bandwidth_mbs)
+              << "  probe read\n";
+    std::cout << std::left << std::setw(24) << "memory_write_bandwidth"
+              << std::right << std::setw(18) << formatMegabytesPerSecond(bw.write_bandwidth_mbs)
+              << "  probe write\n";
+    std::cout << std::left << std::setw(24) << "memory_total_bandwidth"
+              << std::right << std::setw(18) << formatMegabytesPerSecond(bw.total_bandwidth_mbs)
+              << "  probe read + write\n";
     std::cout << std::left << std::setw(24) << "theoretical_max"
               << std::right << std::setw(18) << formatMegabytesPerSecond(theoretical_mbs)
               << "  DDR4-3200 dual-channel\n";
     std::cout << std::left << std::setw(24) << "bandwidth_utilization"
-              << std::right << std::setw(18) << formatPercent(bandwidth_ratio)
-              << "  measured / theoretical\n";
+              << std::right << std::setw(18) << formatPercent(total_bandwidth_ratio)
+              << "  total / theoretical\n";
     std::cout << std::left << std::setw(24) << "gpu_vram_bandwidth"
               << std::right << std::setw(18) << formatMegabytesPerSecond(gpu_vram_mbs)
               << "  theoretical " << fitText(gpu_label, 24) << "\n";
@@ -957,8 +1011,11 @@ void printSystemSnapshot(const std::string& target_device,
               << std::right << std::setw(18)
               << (gpu_mem.valid ? formatPercent(gpu_memory_ratio) : "--")
               << "  used / dedicated\n";
-    std::cout << std::left << std::setw(24) << "bandwidth_bytes"
-              << std::right << std::setw(18) << formatBytes(bw.bytes)
+    std::cout << std::left << std::setw(24) << "read_bytes"
+              << std::right << std::setw(18) << formatBytes(bw.read_bytes)
+              << "  touched by probe\n";
+    std::cout << std::left << std::setw(24) << "write_bytes"
+              << std::right << std::setw(18) << formatBytes(bw.write_bytes)
               << "  touched by probe\n";
     std::cout << std::left << std::setw(24) << "physical_used"
               << std::right << std::setw(18) << formatMegabytes(mem.used_mb)
@@ -968,7 +1025,30 @@ void printSystemSnapshot(const std::string& target_device,
               << "  system\n";
     std::cout << std::left << std::setw(24) << "committed"
               << std::right << std::setw(18) << formatMegabytes(mem.committed_mb)
-              << "  system\n\n";
+              << "  system\n";
+    if (process_target != nullptr && process_mem != nullptr) {
+        if (process_mem->valid) {
+            const double process_sec{std::max(1e-9, process_window_sec)};
+            const double page_fault_rate{
+                (prev_process_mem != nullptr && prev_process_mem->valid)
+                    ? (process_mem->page_faults - prev_process_mem->page_faults) / process_sec
+                    : 0.0};
+            std::cout << std::left << std::setw(24) << "target_working_set"
+                      << std::right << std::setw(18) << formatMegabytes(process_mem->working_set_mb)
+                      << "  " << fitText(process_target->name, 24) << "\n";
+            std::cout << std::left << std::setw(24) << "target_private_bytes"
+                      << std::right << std::setw(18) << formatMegabytes(process_mem->private_mb)
+                      << "  " << fitText(process_target->name, 24) << "\n";
+            std::cout << std::left << std::setw(24) << "target_page_fault_rate"
+                      << std::right << std::setw(14) << std::fixed << std::setprecision(1) << std::max(0.0, page_fault_rate)
+                      << " /s  sampled\n";
+        } else {
+            std::cout << std::left << std::setw(24) << "target_process"
+                      << std::right << std::setw(18) << "--"
+                      << "  unavailable\n";
+        }
+    }
+    std::cout << "\n";
     std::cout << "Ctrl+C to quit\n";
     finishConsoleRedraw();
 }
@@ -1015,7 +1095,10 @@ void printExternalProcessSnapshot(const ProcessTarget& target,
     std::cout << std::left << std::setw(24) << "page_fault_rate"
               << std::right << std::setw(14) << std::fixed << std::setprecision(1) << std::max(0.0, page_fault_rate)
               << " /s  sampled\n";
-    std::cout << std::left << std::setw(24) << "memory_bandwidth"
+    std::cout << std::left << std::setw(24) << "memory_read_bandwidth"
+              << std::right << std::setw(18) << "--"
+              << "  unsupported without hardware counters\n";
+    std::cout << std::left << std::setw(24) << "memory_write_bandwidth"
               << std::right << std::setw(18) << "--"
               << "  unsupported without hardware counters\n\n";
     std::cout << "Ctrl+C to quit\n";
@@ -1052,11 +1135,27 @@ int main(int argc, char** argv) {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(opt.interval_ms));
 
+            const auto bw{measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms)};
             const auto now{Clock::now()};
             const double sec{std::max(1e-9, std::chrono::duration_cast<std::chrono::duration<double>>(now - last_sample_at).count())};
+            const auto mem{sampleSystemMemory()};
+            const auto gpu_mem{sampleGpuMemory(opt.gpu_index)};
             const auto now_mem{sampleProcessMemory(target.handle.get())};
             redrawConsoleView();
-            printExternalProcessSnapshot(target, selected_device, now_mem, prev_mem, sec);
+            printSystemSnapshot(selected_device,
+                                selected_gpu,
+                                mem,
+                                gpu_mem,
+                                bw,
+                                opt.workers,
+                                opt.probe_mb,
+                                opt.theoretical_bandwidth_gbs,
+                                opt.gpu_vram_bandwidth_gbs,
+                                sec,
+                                &target,
+                                &now_mem,
+                                &prev_mem,
+                                sec);
             prev_mem = now_mem;
             last_sample_at = now;
 
