@@ -6,6 +6,8 @@ A real-time CLI tool that estimates memory bandwidth and shows which functions a
 
 - System mode (default):
   - System physical memory used/free/committed
+  - Main memory module details from Windows system information
+  - GPU adapter and VRAM/shared-memory details from DXGI
   - Measured read and write memory bandwidth from a short system memory probe
 - Demo/instrumentation mode:
   - Real-time throughput view (windowed MB/s)
@@ -132,7 +134,9 @@ Tune the bandwidth probe:
 ./build/Release/mbm_cli.exe --workers 4 --probe-mb 256 --interval-ms 500
 ```
 
-Override the theoretical RAM bandwidth used as the 100% scale:
+By default, the theoretical RAM bandwidth used as the 100% scale is estimated
+from Windows system information (`Win32_PhysicalMemory` speed and data width).
+Override it manually when you want a known platform value:
 
 ```powershell
 ./build/Release/mbm_cli.exe --theoretical-gbs 51.2
@@ -207,6 +211,7 @@ Notes:
 ## Limitations
 
 - Default system mode measures read and write bandwidth with a short memory probe, not direct DRAM hardware counters.
+- The default theoretical maximum is estimated from Windows system memory information when available, and falls back to 51.2 GB/s otherwise.
 - Demo mode is function-level estimated bandwidth, not direct DRAM hardware counter sampling.
 - Accuracy depends on correct byte annotations in hot paths.
 - `--pid` and `--process-name` add process memory state only. The read/write bandwidth remains the system probe, not per-process bandwidth.

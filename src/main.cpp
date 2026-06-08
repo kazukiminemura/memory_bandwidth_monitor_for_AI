@@ -25,10 +25,12 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi1_6.h>
+#include <objbase.h>
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <wbemidl.h>
 #endif
 
 namespace {
@@ -49,6 +51,8 @@ struct Options {
     std::size_t top{10};
     std::size_t probe_mb{256};
     double theoretical_bandwidth_gbs{51.2};
+    bool theoretical_bandwidth_overridden{false};
+    std::string theoretical_bandwidth_source{"fallback default"};
     double gpu_vram_bandwidth_gbs{456.0};
     std::string device{"cpu"};
     std::size_t gpu_index{0};
@@ -93,6 +97,11 @@ struct GpuDevice {
     std::size_t index{0};
     std::string name;
     double dedicated_memory_mb{0.0};
+    double dedicated_system_memory_mb{0.0};
+    double shared_system_memory_mb{0.0};
+    unsigned int vendor_id{0};
+    unsigned int device_id{0};
+    unsigned int revision{0};
 };
 
 std::atomic<bool> g_running{true};
@@ -252,11 +261,26 @@ std::vector<GpuDevice> enumerateGpuDevices() {
         ComPtr<IDXGIAdapter1> adapter{raw_adapter};
         DXGI_ADAPTER_DESC1 desc{};
         if (adapter->GetDesc1(&desc) == S_OK && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-            devices.push_back({devices.size(), narrow(desc.Description), bytesToMb(desc.DedicatedVideoMemory)});
+            devices.push_back({devices.size(),
+                               narrow(desc.Description),
+                               bytesToMb(desc.DedicatedVideoMemory),
+                               bytesToMb(desc.DedicatedSystemMemory),
+                               bytesToMb(desc.SharedSystemMemory),
+                               desc.VendorId,
+                               desc.DeviceId,
+                               desc.Revision});
         }
     }
 #endif
     return devices;
+}
+
+std::string gpuHardwareId(const GpuDevice& gpu) {
+    std::ostringstream out;
+    out << "VEN_" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << gpu.vendor_id
+        << " DEV_" << std::setw(4) << gpu.device_id
+        << std::dec << std::setfill(' ') << " rev " << gpu.revision;
+    return out.str();
 }
 
 std::string targetDeviceLabel(const Options& opt) {
@@ -425,7 +449,10 @@ void printDevices() {
     }
 
     for (const auto& gpu : gpus) {
-        std::cout << "  GPU[" << gpu.index << "] " << gpu.name << "\n";
+        std::cout << "  GPU[" << gpu.index << "] " << gpu.name
+                  << "   dedicated " << formatMegabytes(gpu.dedicated_memory_mb)
+                  << "   shared " << formatMegabytes(gpu.shared_system_memory_mb)
+                  << "   " << gpuHardwareId(gpu) << "\n";
     }
 }
 
@@ -507,6 +534,427 @@ SystemMemorySnapshot sampleSystemMemory() {
 #endif
     return snap;
 }
+
+struct MemoryModuleInfo {
+    double capacity_mb{0.0};
+    std::string bank_label;
+    std::string device_locator;
+    std::string manufacturer;
+    std::string part_number;
+    std::uint32_t configured_clock_speed{0};
+    std::uint32_t speed{0};
+    std::uint32_t data_width{0};
+    std::uint32_t total_width{0};
+    std::uint32_t configured_voltage{0};
+    std::uint32_t min_voltage{0};
+    std::uint32_t max_voltage{0};
+    std::uint32_t form_factor{0};
+    std::uint32_t memory_type{0};
+    std::uint32_t smbios_memory_type{0};
+    std::uint32_t type_detail{0};
+};
+
+struct MemoryBandwidthInfo {
+    double gbs{0.0};
+    double total_capacity_mb{0.0};
+    std::size_t module_count{0};
+    std::vector<MemoryModuleInfo> modules;
+    std::string summary;
+    std::string source;
+    bool valid{false};
+};
+
+#ifdef _WIN32
+std::uint32_t variantToUint32(const VARIANT& value) {
+    switch (value.vt) {
+    case VT_UI1:
+        return value.bVal;
+    case VT_I1:
+        return static_cast<std::uint32_t>(std::max<signed char>(0, value.cVal));
+    case VT_UI2:
+        return value.uiVal;
+    case VT_I2:
+        return static_cast<std::uint32_t>(std::max<short>(0, value.iVal));
+    case VT_UI4:
+        return value.ulVal;
+    case VT_UINT:
+        return value.uintVal;
+    case VT_I4:
+        return static_cast<std::uint32_t>(std::max<long>(0, value.lVal));
+    case VT_INT:
+        return static_cast<std::uint32_t>(std::max<int>(0, value.intVal));
+    default:
+        return 0;
+    }
+}
+
+std::uint64_t variantToUint64(const VARIANT& value) {
+    switch (value.vt) {
+    case VT_UI1:
+        return value.bVal;
+    case VT_I1:
+        return static_cast<std::uint64_t>(std::max<signed char>(0, value.cVal));
+    case VT_UI2:
+        return value.uiVal;
+    case VT_I2:
+        return static_cast<std::uint64_t>(std::max<short>(0, value.iVal));
+    case VT_UI4:
+        return value.ulVal;
+    case VT_UINT:
+        return value.uintVal;
+    case VT_I4:
+        return static_cast<std::uint64_t>(std::max<long>(0, value.lVal));
+    case VT_INT:
+        return static_cast<std::uint64_t>(std::max<int>(0, value.intVal));
+    case VT_UI8:
+        return value.ullVal;
+    case VT_I8:
+        return static_cast<std::uint64_t>(std::max<long long>(0, value.llVal));
+    case VT_BSTR:
+        return (value.bstrVal == nullptr) ? 0 : std::wcstoull(value.bstrVal, nullptr, 10);
+    default:
+        return 0;
+    }
+}
+
+std::string trimCopy(std::string value) {
+    const auto first{value.find_first_not_of(" \t\r\n")};
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last{value.find_last_not_of(" \t\r\n")};
+    return value.substr(first, last - first + 1);
+}
+
+std::string variantToString(const VARIANT& value) {
+    if (value.vt == VT_BSTR && value.bstrVal != nullptr) {
+        return trimCopy(narrow(value.bstrVal));
+    }
+    return {};
+}
+
+class BStr {
+public:
+    explicit BStr(const wchar_t* value) : value_{SysAllocString(value)} {}
+    ~BStr() {
+        SysFreeString(value_);
+    }
+
+    BStr(const BStr&) = delete;
+    BStr& operator=(const BStr&) = delete;
+
+    operator BSTR() const {
+        return value_;
+    }
+
+private:
+    BSTR value_{nullptr};
+};
+
+class ComInitGuard {
+public:
+    ComInitGuard() : hr_{CoInitializeEx(nullptr, COINIT_MULTITHREADED)} {}
+    ~ComInitGuard() {
+        if (SUCCEEDED(hr_)) {
+            CoUninitialize();
+        }
+    }
+
+    ComInitGuard(const ComInitGuard&) = delete;
+    ComInitGuard& operator=(const ComInitGuard&) = delete;
+
+    bool available() const {
+        return SUCCEEDED(hr_) || hr_ == RPC_E_CHANGED_MODE;
+    }
+
+private:
+    HRESULT hr_{E_FAIL};
+};
+
+std::uint32_t getWmiUint32(IWbemClassObject& object, const wchar_t* name) {
+    VARIANT value{};
+    VariantInit(&value);
+    BStr prop_name{name};
+    object.Get(prop_name, 0, &value, nullptr, nullptr);
+    const std::uint32_t out{variantToUint32(value)};
+    VariantClear(&value);
+    return out;
+}
+
+std::uint64_t getWmiUint64(IWbemClassObject& object, const wchar_t* name) {
+    VARIANT value{};
+    VariantInit(&value);
+    BStr prop_name{name};
+    object.Get(prop_name, 0, &value, nullptr, nullptr);
+    const std::uint64_t out{variantToUint64(value)};
+    VariantClear(&value);
+    return out;
+}
+
+std::string getWmiString(IWbemClassObject& object, const wchar_t* name) {
+    VARIANT value{};
+    VariantInit(&value);
+    BStr prop_name{name};
+    object.Get(prop_name, 0, &value, nullptr, nullptr);
+    std::string out{variantToString(value)};
+    VariantClear(&value);
+    return out;
+}
+
+std::string formFactorName(std::uint32_t form_factor) {
+    switch (form_factor) {
+    case 8:
+        return "DIMM";
+    case 12:
+        return "SODIMM";
+    case 13:
+        return "SRIMM";
+    case 14:
+        return "SMD";
+    case 15:
+        return "SSMP";
+    case 16:
+        return "QFP";
+    case 17:
+        return "TQFP";
+    case 18:
+        return "SOIC";
+    case 19:
+        return "LCC";
+    case 20:
+        return "PLCC";
+    case 21:
+        return "BGA";
+    case 22:
+        return "FPBGA";
+    case 23:
+        return "LGA";
+    default:
+        return form_factor == 0 ? "unknown form" : "form " + std::to_string(form_factor);
+    }
+}
+
+std::string memoryTypeName(std::uint32_t smbios_type, std::uint32_t memory_type) {
+    const std::uint32_t type{smbios_type != 0 ? smbios_type : memory_type};
+    switch (type) {
+    case 20:
+        return "DDR";
+    case 21:
+        return "DDR2";
+    case 24:
+        return "DDR3";
+    case 26:
+        return "DDR4";
+    case 27:
+        return "LPDDR";
+    case 28:
+        return "LPDDR2";
+    case 29:
+        return "LPDDR3";
+    case 30:
+        return "LPDDR4";
+    case 31:
+        return "Logical non-volatile";
+    case 34:
+        return "DDR5";
+    case 35:
+        return "LPDDR5";
+    case 36:
+        return "HBM3";
+    default:
+        return type == 0 ? "unknown type" : "type " + std::to_string(type);
+    }
+}
+
+std::string voltageSummary(const MemoryModuleInfo& module) {
+    auto volts = [](std::uint32_t millivolts) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(2) << (millivolts / 1000.0);
+        return out.str();
+    };
+
+    if (module.configured_voltage > 0) {
+        return volts(module.configured_voltage) + " V";
+    }
+    if (module.min_voltage > 0 && module.max_voltage > 0) {
+        return volts(module.min_voltage) + "-" + volts(module.max_voltage) + " V";
+    }
+    return "voltage n/a";
+}
+
+std::string memoryModuleShortName(const MemoryModuleInfo& module) {
+    std::string label{module.manufacturer};
+    if (!module.part_number.empty()) {
+        if (!label.empty()) {
+            label += " ";
+        }
+        label += module.part_number;
+    }
+    return label.empty() ? "module" : label;
+}
+
+MemoryBandwidthInfo querySystemMemoryBandwidthInfo() {
+    MemoryBandwidthInfo info{};
+
+    ComInitGuard com;
+    if (!com.available()) {
+        return info;
+    }
+
+    const HRESULT security_hr{CoInitializeSecurity(nullptr,
+                                                   -1,
+                                                   nullptr,
+                                                   nullptr,
+                                                   RPC_C_AUTHN_LEVEL_DEFAULT,
+                                                   RPC_C_IMP_LEVEL_IMPERSONATE,
+                                                   nullptr,
+                                                   EOAC_NONE,
+                                                   nullptr)};
+    if (FAILED(security_hr) && security_hr != RPC_E_TOO_LATE) {
+        return info;
+    }
+
+    IWbemLocator* locator_raw{nullptr};
+    HRESULT hr{CoCreateInstance(CLSID_WbemLocator,
+                                nullptr,
+                                CLSCTX_INPROC_SERVER,
+                                IID_IWbemLocator,
+                                reinterpret_cast<void**>(&locator_raw))};
+    ComPtr<IWbemLocator> locator{locator_raw};
+    if (FAILED(hr) || locator == nullptr) {
+        return info;
+    }
+
+    IWbemServices* services_raw{nullptr};
+    BStr cimv2{L"ROOT\\CIMV2"};
+    hr = locator->ConnectServer(cimv2, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &services_raw);
+    ComPtr<IWbemServices> services{services_raw};
+    if (FAILED(hr) || services == nullptr) {
+        return info;
+    }
+
+    hr = CoSetProxyBlanket(services.get(),
+                           RPC_C_AUTHN_WINNT,
+                           RPC_C_AUTHZ_NONE,
+                           nullptr,
+                           RPC_C_AUTHN_LEVEL_CALL,
+                           RPC_C_IMP_LEVEL_IMPERSONATE,
+                           nullptr,
+                           EOAC_NONE);
+    if (FAILED(hr)) {
+        return info;
+    }
+
+    IEnumWbemClassObject* enumerator_raw{nullptr};
+    BStr wql{L"WQL"};
+    BStr query{
+        L"SELECT BankLabel, Capacity, ConfiguredClockSpeed, ConfiguredVoltage, DataWidth, DeviceLocator, "
+        L"FormFactor, Manufacturer, MaxVoltage, MemoryType, MinVoltage, PartNumber, SMBIOSMemoryType, Speed, "
+        L"TotalWidth, TypeDetail FROM Win32_PhysicalMemory"};
+    hr = services->ExecQuery(wql,
+                             query,
+                             WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                             nullptr,
+                             &enumerator_raw);
+    ComPtr<IEnumWbemClassObject> enumerator{enumerator_raw};
+    if (FAILED(hr) || enumerator == nullptr) {
+        return info;
+    }
+
+    double total_bandwidth_mbs{0.0};
+    double total_capacity_mb{0.0};
+    std::uint32_t first_speed{0};
+    std::uint32_t first_width{0};
+    std::uint32_t first_type{0};
+    std::uint32_t first_form_factor{0};
+    bool mixed{false};
+
+    while (true) {
+        IWbemClassObject* object_raw{nullptr};
+        ULONG returned{0};
+        hr = enumerator->Next(WBEM_INFINITE, 1, &object_raw, &returned);
+        ComPtr<IWbemClassObject> object{object_raw};
+        if (FAILED(hr) || returned == 0 || object == nullptr) {
+            break;
+        }
+
+        MemoryModuleInfo module{};
+        module.bank_label = getWmiString(*object, L"BankLabel");
+        module.device_locator = getWmiString(*object, L"DeviceLocator");
+        module.manufacturer = getWmiString(*object, L"Manufacturer");
+        module.part_number = getWmiString(*object, L"PartNumber");
+        module.capacity_mb = bytesToMb(getWmiUint64(*object, L"Capacity"));
+        module.configured_clock_speed = getWmiUint32(*object, L"ConfiguredClockSpeed");
+        module.speed = getWmiUint32(*object, L"Speed");
+        module.data_width = getWmiUint32(*object, L"DataWidth");
+        module.total_width = getWmiUint32(*object, L"TotalWidth");
+        module.configured_voltage = getWmiUint32(*object, L"ConfiguredVoltage");
+        module.min_voltage = getWmiUint32(*object, L"MinVoltage");
+        module.max_voltage = getWmiUint32(*object, L"MaxVoltage");
+        module.form_factor = getWmiUint32(*object, L"FormFactor");
+        module.memory_type = getWmiUint32(*object, L"MemoryType");
+        module.smbios_memory_type = getWmiUint32(*object, L"SMBIOSMemoryType");
+        module.type_detail = getWmiUint32(*object, L"TypeDetail");
+
+        const std::uint32_t speed_mtps{std::max(module.configured_clock_speed, module.speed)};
+        const std::uint32_t width_bits{module.data_width};
+
+        const std::uint32_t effective_width_bits{(width_bits == 0) ? 64 : width_bits};
+        if (speed_mtps > 0) {
+            total_bandwidth_mbs += static_cast<double>(speed_mtps) * static_cast<double>(effective_width_bits) / 8.0;
+        }
+        total_capacity_mb += module.capacity_mb;
+
+        if (info.modules.empty()) {
+            first_speed = speed_mtps;
+            first_width = effective_width_bits;
+            first_type = module.smbios_memory_type != 0 ? module.smbios_memory_type : module.memory_type;
+            first_form_factor = module.form_factor;
+        } else if (speed_mtps != first_speed ||
+                   effective_width_bits != first_width ||
+                   (module.smbios_memory_type != 0 ? module.smbios_memory_type : module.memory_type) != first_type ||
+                   module.form_factor != first_form_factor) {
+            mixed = true;
+        }
+        info.modules.push_back(std::move(module));
+    }
+
+    if (!info.modules.empty()) {
+        const MemoryModuleInfo& first{info.modules.front()};
+        std::ostringstream summary;
+        summary << info.modules.size() << "x " << std::fixed << std::setprecision(1)
+                << (first.capacity_mb / 1024.0) << " GB "
+                << memoryTypeName(first.smbios_memory_type, first.memory_type) << " "
+                << (first_speed > 0 ? std::to_string(first_speed) + " MT/s" : "speed n/a")
+                << ", " << formFactorName(first.form_factor);
+        if (mixed) {
+            summary.str({});
+            summary.clear();
+            summary << info.modules.size() << " mixed modules";
+        }
+
+        std::ostringstream source;
+        source << "WMI Win32_PhysicalMemory";
+        if (mixed) {
+            source << ", " << info.modules.size() << " modules";
+        } else {
+            source << ", " << info.modules.size() << "x " << first_speed << " MT/s x " << first_width << "-bit";
+        }
+        info.gbs = total_bandwidth_mbs / 1024.0;
+        info.total_capacity_mb = total_capacity_mb;
+        info.module_count = info.modules.size();
+        info.summary = summary.str();
+        info.source = source.str();
+        info.valid = total_bandwidth_mbs > 0.0;
+    }
+
+    return info;
+}
+#else
+MemoryBandwidthInfo querySystemMemoryBandwidthInfo() {
+    return {};
+}
+#endif
 
 BandwidthProbeSnapshot measureSystemMemoryBandwidth(std::size_t workers, std::size_t probe_mb, int interval_ms) {
     const std::size_t worker_count{std::max<std::size_t>(1, workers)};
@@ -667,6 +1115,8 @@ void parseArgs(int argc, char** argv, Options& opt) {
             readPositive(argc, argv, i, opt.probe_mb);
         } else if (a == "--theoretical-gbs" && i + 1 < argc) {
             readPositive(argc, argv, i, opt.theoretical_bandwidth_gbs);
+            opt.theoretical_bandwidth_overridden = true;
+            opt.theoretical_bandwidth_source = "command line";
         } else if (a == "--gpu-vram-gbs" && i + 1 < argc) {
             readPositive(argc, argv, i, opt.gpu_vram_bandwidth_gbs);
         } else if (a == "--device" && i + 1 < argc) {
@@ -702,7 +1152,7 @@ void parseArgs(int argc, char** argv, Options& opt) {
                 << "  --duration-sec N   Stop automatically after N seconds (default: 0 = run until Ctrl+C)\n"
                 << "  --top N            Show top N functions by bytes/window (default: 10)\n"
                 << "  --probe-mb N       Total memory used by the system bandwidth probe (default: 256)\n"
-                << "  --theoretical-gbs N  Theoretical RAM bandwidth used as 100% in system mode (default: 51.2)\n"
+                << "  --theoretical-gbs N  Override theoretical RAM bandwidth used as 100% in system mode\n"
                 << "  --gpu-vram-gbs N   Theoretical GPU VRAM bandwidth to show in system mode (default: 456.0)\n"
                 << "  --device cpu|gpu   Select target device label (default: cpu)\n"
                 << "  --gpu-index N      Select GPU adapter index when --device gpu is used (default: 0)\n"
@@ -901,12 +1351,15 @@ void printSnapshot(const mbm::WindowSnapshot& snap,
 
 void printSystemSnapshot(const std::string& target_device,
                          const std::string& gpu_label,
+                         const GpuDevice* gpu_device,
                          const SystemMemorySnapshot& mem,
+                         const MemoryBandwidthInfo& memory_info,
                          const GpuMemorySnapshot& gpu_mem,
                          const BandwidthProbeSnapshot& bw,
                          std::size_t workers,
                          std::size_t probe_mb,
                          double theoretical_bandwidth_gbs,
+                         const std::string& theoretical_bandwidth_source,
                          double gpu_vram_bandwidth_gbs,
                          double window_sec,
                          const ProcessTarget* process_target = nullptr,
@@ -927,6 +1380,42 @@ void printSystemSnapshot(const std::string& target_device,
               << "   Probe: " << formatMegabytes(probe_mb)
               << "   Max: " << formatMegabytesPerSecond(theoretical_mbs)
               << "   Sample: " << std::setprecision(0) << bw.seconds * 1000.0 << " ms\n";
+    std::cout << "Max source: " << theoretical_bandwidth_source << "\n";
+    if (!memory_info.modules.empty()) {
+        std::cout << "RAM config: " << memory_info.summary;
+        if (memory_info.total_capacity_mb > 0.0) {
+            std::cout << "   SPD/WMI total: " << formatMegabytes(memory_info.total_capacity_mb);
+        }
+        std::cout << "\n";
+        const std::size_t shown_modules{std::min<std::size_t>(memory_info.modules.size(), 4)};
+        for (std::size_t i{0}; i < shown_modules; ++i) {
+            const auto& module{memory_info.modules[i]};
+            const std::uint32_t speed{std::max(module.configured_clock_speed, module.speed)};
+            const std::uint32_t width{module.data_width == 0 ? 64 : module.data_width};
+            const std::string slot{!module.device_locator.empty() ? module.device_locator : module.bank_label};
+            std::cout << "  RAM[" << i << "] "
+                      << fitText(slot.empty() ? "slot" : slot, 10) << " "
+                      << std::setw(8) << formatMegabytes(module.capacity_mb) << " "
+                      << fitText(memoryTypeName(module.smbios_memory_type, module.memory_type), 8) << " "
+                      << (speed > 0 ? std::to_string(speed) + " MT/s" : "speed n/a") << " "
+                      << width << "-bit";
+            if (module.total_width > 0 && module.total_width != width) {
+                std::cout << "/" << module.total_width << "-bit total";
+            }
+            std::cout << " " << fitText(formFactorName(module.form_factor), 8)
+                      << " " << voltageSummary(module)
+                      << " " << fitText(memoryModuleShortName(module), 30) << "\n";
+        }
+        if (memory_info.modules.size() > shown_modules) {
+            std::cout << "  ... " << (memory_info.modules.size() - shown_modules) << " more RAM modules\n";
+        }
+    }
+    if (gpu_device != nullptr) {
+        std::cout << "GPU config: " << fitText(gpu_device->name, 42)
+                  << "   dedicated " << formatMegabytes(gpu_device->dedicated_memory_mb)
+                  << "   shared " << formatMegabytes(gpu_device->shared_system_memory_mb)
+                  << "   " << gpuHardwareId(*gpu_device) << "\n";
+    }
     if (process_target != nullptr) {
         std::cout << "Target: " << process_target->name
                   << "   PID: " << process_target->pid << "\n";
@@ -992,7 +1481,7 @@ void printSystemSnapshot(const std::string& target_device,
               << "  probe read + write\n";
     std::cout << std::left << std::setw(24) << "theoretical_max"
               << std::right << std::setw(18) << formatMegabytesPerSecond(theoretical_mbs)
-              << "  DDR4-3200 dual-channel\n";
+              << "  " << fitText(theoretical_bandwidth_source, 24) << "\n";
     std::cout << std::left << std::setw(24) << "bandwidth_utilization"
               << std::right << std::setw(18) << formatPercent(total_bandwidth_ratio)
               << "  total / theoretical\n";
@@ -1007,6 +1496,14 @@ void printSystemSnapshot(const std::string& target_device,
               << std::right << std::setw(18)
               << (gpu_mem.valid ? formatMegabytes(gpu_mem.dedicated_total_mb) : "--")
               << "  dedicated capacity\n";
+    if (gpu_device != nullptr) {
+        std::cout << std::left << std::setw(24) << "gpu_shared_memory"
+                  << std::right << std::setw(18) << formatMegabytes(gpu_device->shared_system_memory_mb)
+                  << "  DXGI shared system\n";
+        std::cout << std::left << std::setw(24) << "gpu_hardware_id"
+                  << std::right << std::setw(18) << fitText(gpuHardwareId(*gpu_device), 18)
+                  << "  DXGI adapter\n";
+    }
     std::cout << std::left << std::setw(24) << "gpu_vram_utilization"
               << std::right << std::setw(18)
               << (gpu_mem.valid ? formatPercent(gpu_memory_ratio) : "--")
@@ -1023,6 +1520,17 @@ void printSystemSnapshot(const std::string& target_device,
     std::cout << std::left << std::setw(24) << "physical_available"
               << std::right << std::setw(18) << formatMegabytes(mem.available_mb)
               << "  system\n";
+    std::cout << std::left << std::setw(24) << "physical_total"
+              << std::right << std::setw(18) << formatMegabytes(mem.total_mb)
+              << "  system\n";
+    if (!memory_info.modules.empty()) {
+        std::cout << std::left << std::setw(24) << "ram_modules"
+                  << std::right << std::setw(18) << memory_info.modules.size()
+                  << "  WMI PhysicalMemory\n";
+        std::cout << std::left << std::setw(24) << "ram_config"
+                  << std::right << std::setw(18) << fitText(memory_info.summary, 18)
+                  << "  WMI PhysicalMemory\n";
+    }
     std::cout << std::left << std::setw(24) << "committed"
               << std::right << std::setw(18) << formatMegabytes(mem.committed_mb)
               << "  system\n";
@@ -1117,8 +1625,18 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    const auto memory_info{querySystemMemoryBandwidthInfo()};
+    if (!opt.theoretical_bandwidth_overridden && memory_info.valid) {
+        opt.theoretical_bandwidth_gbs = memory_info.gbs;
+        opt.theoretical_bandwidth_source = memory_info.source;
+    }
+
+    const auto gpu_devices{enumerateGpuDevices()};
+    const GpuDevice* selected_gpu_info{opt.gpu_index < gpu_devices.size() ? &gpu_devices[opt.gpu_index] : nullptr};
     const std::string selected_device{targetDeviceLabel(opt)};
-    const std::string selected_gpu{gpuDeviceLabel(opt.gpu_index)};
+    const std::string selected_gpu{selected_gpu_info != nullptr
+                                       ? "GPU[" + std::to_string(opt.gpu_index) + "] " + selected_gpu_info->name
+                                       : gpuDeviceLabel(opt.gpu_index)};
 
 #ifdef _WIN32
     SetConsoleCtrlHandler(HandleCtrl, TRUE);
@@ -1144,12 +1662,15 @@ int main(int argc, char** argv) {
             redrawConsoleView();
             printSystemSnapshot(selected_device,
                                 selected_gpu,
+                                selected_gpu_info,
                                 mem,
+                                memory_info,
                                 gpu_mem,
                                 bw,
                                 opt.workers,
                                 opt.probe_mb,
                                 opt.theoretical_bandwidth_gbs,
+                                opt.theoretical_bandwidth_source,
                                 opt.gpu_vram_bandwidth_gbs,
                                 sec,
                                 &target,
@@ -1196,12 +1717,15 @@ int main(int argc, char** argv) {
             redrawConsoleView();
             printSystemSnapshot(selected_device,
                                 selected_gpu,
+                                selected_gpu_info,
                                 mem,
+                                memory_info,
                                 gpu_mem,
                                 bw,
                                 opt.workers,
                                 opt.probe_mb,
                                 opt.theoretical_bandwidth_gbs,
+                                opt.theoretical_bandwidth_source,
                                 opt.gpu_vram_bandwidth_gbs,
                                 sec);
             last_sample_at = now;

@@ -21,5 +21,5 @@ add_executable(mbm_cli
 target_link_libraries(mbm_cli PRIVATE mbm)
 
 if(WIN32)
-    target_link_libraries(mbm_cli PRIVATE psapi dxgi pdh)
+    target_link_libraries(mbm_cli PRIVATE psapi dxgi pdh wbemuuid ole32 oleaut32)
 endif()
