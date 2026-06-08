@@ -50,6 +50,7 @@ struct Options {
     RunMode mode{RunMode::System};
     std::size_t top{10};
     std::size_t probe_mb{256};
+    bool run_bandwidth_probe{false};
     double theoretical_bandwidth_gbs{51.2};
     bool theoretical_bandwidth_overridden{false};
     std::string theoretical_bandwidth_source{"fallback default"};
@@ -85,6 +86,7 @@ struct BandwidthProbeSnapshot {
     double seconds{0.0};
     std::uint64_t read_bytes{0};
     std::uint64_t write_bytes{0};
+    bool valid{false};
 };
 
 struct GpuMemorySnapshot {
@@ -1029,6 +1031,7 @@ BandwidthProbeSnapshot measureSystemMemoryBandwidth(std::size_t workers, std::si
     snap.read_bandwidth_mbs = bytesToMb(snap.read_bytes) / read_sec;
     snap.write_bandwidth_mbs = bytesToMb(snap.write_bytes) / write_sec;
     snap.total_bandwidth_mbs = snap.read_bandwidth_mbs + snap.write_bandwidth_mbs;
+    snap.valid = true;
     return snap;
 }
 
@@ -1113,6 +1116,10 @@ void parseArgs(int argc, char** argv, Options& opt) {
             readPositive(argc, argv, i, opt.top);
         } else if (a == "--probe-mb") {
             readPositive(argc, argv, i, opt.probe_mb);
+        } else if (a == "--probe-bandwidth") {
+            opt.run_bandwidth_probe = true;
+        } else if (a == "--no-probe") {
+            opt.run_bandwidth_probe = false;
         } else if (a == "--theoretical-gbs" && i + 1 < argc) {
             readPositive(argc, argv, i, opt.theoretical_bandwidth_gbs);
             opt.theoretical_bandwidth_overridden = true;
@@ -1151,7 +1158,9 @@ void parseArgs(int argc, char** argv, Options& opt) {
                 << "  --workers N        Number of bandwidth/demo worker threads (default: half cores)\n"
                 << "  --duration-sec N   Stop automatically after N seconds (default: 0 = run until Ctrl+C)\n"
                 << "  --top N            Show top N functions by bytes/window (default: 10)\n"
-                << "  --probe-mb N       Total memory used by the system bandwidth probe (default: 256)\n"
+                << "  --probe-bandwidth  Run the synthetic system memory bandwidth probe (default: off)\n"
+                << "  --probe-mb N       Total memory used by the bandwidth probe when enabled (default: 256)\n"
+                << "  --no-probe         Keep synthetic bandwidth probing disabled\n"
                 << "  --theoretical-gbs N  Override theoretical RAM bandwidth used as 100% in system mode\n"
                 << "  --gpu-vram-gbs N   Theoretical GPU VRAM bandwidth to show in system mode (default: 456.0)\n"
                 << "  --device cpu|gpu   Select target device label (default: cpu)\n"
@@ -1377,9 +1386,11 @@ void printSystemSnapshot(const std::string& target_device,
     printTopLine("MBM system memory monitor", "device " + target_device);
     std::cout << "Window: " << std::fixed << std::setprecision(0) << window_sec * 1000.0 << " ms"
               << "   Workers: " << workers
-              << "   Probe: " << formatMegabytes(probe_mb)
+              << "   Probe: " << (bw.valid ? formatMegabytes(probe_mb) : std::string("off"))
               << "   Max: " << formatMegabytesPerSecond(theoretical_mbs)
-              << "   Sample: " << std::setprecision(0) << bw.seconds * 1000.0 << " ms\n";
+              << "   Sample: "
+              << (bw.valid ? formatNumber(bw.seconds * 1000.0, 0) + " ms" : std::string("live counters only"))
+              << "\n";
     std::cout << "Max source: " << theoretical_bandwidth_source << "\n";
     if (!memory_info.modules.empty()) {
         std::cout << "RAM config: " << memory_info.summary;
@@ -1439,16 +1450,27 @@ void printSystemSnapshot(const std::string& target_device,
     std::cout << " Cmit [" << usageBar(mem.committed_mb, commit_scale, 40) << "] "
               << std::right << std::setw(10) << formatMegabytes(mem.committed_mb)
               << " / " << std::setw(10) << formatMegabytes(mem.commit_limit_mb) << " committed\n";
-    std::cout << " Read [" << usageBar(bw.read_bandwidth_mbs, theoretical_mbs, 40) << "] "
-              << std::right << std::setw(10) << formatMegabytesPerSecond(bw.read_bandwidth_mbs)
-              << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
-              << "  " << std::setw(4) << formatPercent(read_bandwidth_ratio)
-              << " measured read\n";
-    std::cout << "Write [" << usageBar(bw.write_bandwidth_mbs, theoretical_mbs, 40) << "] "
-              << std::right << std::setw(10) << formatMegabytesPerSecond(bw.write_bandwidth_mbs)
-              << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
-              << "  " << std::setw(4) << formatPercent(write_bandwidth_ratio)
-              << " measured write\n\n";
+    if (bw.valid) {
+        std::cout << " Read [" << usageBar(bw.read_bandwidth_mbs, theoretical_mbs, 40) << "] "
+                  << std::right << std::setw(10) << formatMegabytesPerSecond(bw.read_bandwidth_mbs)
+                  << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
+                  << "  " << std::setw(4) << formatPercent(read_bandwidth_ratio)
+                  << " synthetic probe read\n";
+        std::cout << "Write [" << usageBar(bw.write_bandwidth_mbs, theoretical_mbs, 40) << "] "
+                  << std::right << std::setw(10) << formatMegabytesPerSecond(bw.write_bandwidth_mbs)
+                  << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
+                  << "  " << std::setw(4) << formatPercent(write_bandwidth_ratio)
+                  << " synthetic probe write\n\n";
+    } else {
+        std::cout << " Read [" << usageBar(0.0, 1.0, 40) << "] "
+                  << std::right << std::setw(10) << "--"
+                  << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
+                  << "  actual DRAM read bandwidth unavailable\n";
+        std::cout << "Write [" << usageBar(0.0, 1.0, 40) << "] "
+                  << std::right << std::setw(10) << "--"
+                  << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
+                  << "  actual DRAM write bandwidth unavailable\n\n";
+    }
     if (gpu_mem.valid) {
         std::cout << " VRAM [" << usageBar(gpu_mem.dedicated_used_mb, gpu_mem.dedicated_total_mb, 40) << "] "
                   << std::right << std::setw(10) << formatMegabytes(gpu_mem.dedicated_used_mb)
@@ -1471,20 +1493,20 @@ void printSystemSnapshot(const std::string& target_device,
               << "  Status"
               << "\x1b[0m\n";
     std::cout << std::left << std::setw(24) << "memory_read_bandwidth"
-              << std::right << std::setw(18) << formatMegabytesPerSecond(bw.read_bandwidth_mbs)
-              << "  probe read\n";
+              << std::right << std::setw(18) << (bw.valid ? formatMegabytesPerSecond(bw.read_bandwidth_mbs) : "--")
+              << "  " << (bw.valid ? "synthetic probe read" : "needs hardware counters") << "\n";
     std::cout << std::left << std::setw(24) << "memory_write_bandwidth"
-              << std::right << std::setw(18) << formatMegabytesPerSecond(bw.write_bandwidth_mbs)
-              << "  probe write\n";
+              << std::right << std::setw(18) << (bw.valid ? formatMegabytesPerSecond(bw.write_bandwidth_mbs) : "--")
+              << "  " << (bw.valid ? "synthetic probe write" : "needs hardware counters") << "\n";
     std::cout << std::left << std::setw(24) << "memory_total_bandwidth"
-              << std::right << std::setw(18) << formatMegabytesPerSecond(bw.total_bandwidth_mbs)
-              << "  probe read + write\n";
+              << std::right << std::setw(18) << (bw.valid ? formatMegabytesPerSecond(bw.total_bandwidth_mbs) : "--")
+              << "  " << (bw.valid ? "synthetic probe read + write" : "needs hardware counters") << "\n";
     std::cout << std::left << std::setw(24) << "theoretical_max"
               << std::right << std::setw(18) << formatMegabytesPerSecond(theoretical_mbs)
               << "  " << fitText(theoretical_bandwidth_source, 24) << "\n";
     std::cout << std::left << std::setw(24) << "bandwidth_utilization"
-              << std::right << std::setw(18) << formatPercent(total_bandwidth_ratio)
-              << "  total / theoretical\n";
+              << std::right << std::setw(18) << (bw.valid ? formatPercent(total_bandwidth_ratio) : "--")
+              << "  " << (bw.valid ? "probe total / theoretical" : "actual unavailable") << "\n";
     std::cout << std::left << std::setw(24) << "gpu_vram_bandwidth"
               << std::right << std::setw(18) << formatMegabytesPerSecond(gpu_vram_mbs)
               << "  theoretical " << fitText(gpu_label, 24) << "\n";
@@ -1509,11 +1531,11 @@ void printSystemSnapshot(const std::string& target_device,
               << (gpu_mem.valid ? formatPercent(gpu_memory_ratio) : "--")
               << "  used / dedicated\n";
     std::cout << std::left << std::setw(24) << "read_bytes"
-              << std::right << std::setw(18) << formatBytes(bw.read_bytes)
-              << "  touched by probe\n";
+              << std::right << std::setw(18) << (bw.valid ? formatBytes(bw.read_bytes) : "--")
+              << "  " << (bw.valid ? "touched by probe" : "probe disabled") << "\n";
     std::cout << std::left << std::setw(24) << "write_bytes"
-              << std::right << std::setw(18) << formatBytes(bw.write_bytes)
-              << "  touched by probe\n";
+              << std::right << std::setw(18) << (bw.valid ? formatBytes(bw.write_bytes) : "--")
+              << "  " << (bw.valid ? "touched by probe" : "probe disabled") << "\n";
     std::cout << std::left << std::setw(24) << "physical_used"
               << std::right << std::setw(18) << formatMegabytes(mem.used_mb)
               << "  system\n";
@@ -1653,7 +1675,9 @@ int main(int argc, char** argv) {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(opt.interval_ms));
 
-            const auto bw{measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms)};
+            const auto bw{opt.run_bandwidth_probe
+                              ? measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms)
+                              : BandwidthProbeSnapshot{}};
             const auto now{Clock::now()};
             const double sec{std::max(1e-9, std::chrono::duration_cast<std::chrono::duration<double>>(now - last_sample_at).count())};
             const auto mem{sampleSystemMemory()};
@@ -1708,7 +1732,9 @@ int main(int argc, char** argv) {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(opt.interval_ms));
 
-            const auto bw{measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms)};
+            const auto bw{opt.run_bandwidth_probe
+                              ? measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms)
+                              : BandwidthProbeSnapshot{}};
             const auto now{Clock::now()};
             const auto mem{sampleSystemMemory()};
             const auto gpu_mem{sampleGpuMemory(opt.gpu_index)};
