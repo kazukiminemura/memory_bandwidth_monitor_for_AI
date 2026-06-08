@@ -4,7 +4,9 @@
 #include <atomic>
 #include <chrono>
 #include <charconv>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +45,11 @@ enum class RunMode {
     Demo,
 };
 
+enum class CounterBackend {
+    None,
+    IntelPcm,
+};
+
 struct Options {
     int interval_ms{500};
     std::size_t workers{std::max(1u, std::thread::hardware_concurrency() / 2u)};
@@ -51,6 +58,8 @@ struct Options {
     std::size_t top{10};
     std::size_t probe_mb{256};
     bool run_bandwidth_probe{false};
+    CounterBackend counter_backend{CounterBackend::None};
+    std::string pcm_path{"pcm-memory.exe"};
     double theoretical_bandwidth_gbs{51.2};
     bool theoretical_bandwidth_overridden{false};
     std::string theoretical_bandwidth_source{"fallback default"};
@@ -87,6 +96,9 @@ struct BandwidthProbeSnapshot {
     std::uint64_t read_bytes{0};
     std::uint64_t write_bytes{0};
     bool valid{false};
+    bool synthetic{false};
+    std::string source;
+    std::string status;
 };
 
 struct GpuMemorySnapshot {
@@ -1032,7 +1044,195 @@ BandwidthProbeSnapshot measureSystemMemoryBandwidth(std::size_t workers, std::si
     snap.write_bandwidth_mbs = bytesToMb(snap.write_bytes) / write_sec;
     snap.total_bandwidth_mbs = snap.read_bandwidth_mbs + snap.write_bandwidth_mbs;
     snap.valid = true;
+    snap.synthetic = true;
+    snap.source = "synthetic probe";
+    snap.status = "synthetic memory probe";
     return snap;
+}
+
+std::vector<std::string> splitCsvLine(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string current;
+    bool quoted{false};
+
+    for (char ch : line) {
+        if (ch == '"') {
+            quoted = !quoted;
+        } else if (ch == ',' && !quoted) {
+            fields.push_back(trimCopy(current));
+            current.clear();
+        } else {
+            current += ch;
+        }
+    }
+    fields.push_back(trimCopy(current));
+    return fields;
+}
+
+std::string lowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool parseDoubleField(const std::string& text, double& out) {
+    const std::string value{trimCopy(text)};
+    if (value.empty()) {
+        return false;
+    }
+
+    char* end{nullptr};
+    const double parsed{std::strtod(value.c_str(), &end)};
+    if (end == value.c_str()) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
+std::string firstOutputLine(const std::string& output) {
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = trimCopy(line);
+        if (!line.empty()) {
+            return fitText(line, 72);
+        }
+    }
+    return {};
+}
+
+std::string quoteCommandArg(const std::string& arg) {
+    std::string out{"\""};
+    for (char ch : arg) {
+        if (ch == '"') {
+            out += "\\\"";
+        } else {
+            out += ch;
+        }
+    }
+    out += "\"";
+    return out;
+}
+
+BandwidthProbeSnapshot sampleIntelPcmMemoryBandwidth(const std::string& pcm_path, int interval_ms) {
+    BandwidthProbeSnapshot snap{};
+    snap.source = "Intel PCM";
+
+#ifdef _WIN32
+    const double delay_sec{std::max(0.05, interval_ms / 1000.0)};
+    std::ostringstream command;
+    command << quoteCommandArg(pcm_path)
+            << " " << std::fixed << std::setprecision(3) << delay_sec
+            << " -csv -silent -nc -i=1 2>&1";
+
+    FILE* pipe{_popen(command.str().c_str(), "r")};
+    if (pipe == nullptr) {
+        snap.status = "could not start pcm-memory.exe";
+        return snap;
+    }
+
+    std::string output;
+    char buffer[512]{};
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+    const int exit_code{_pclose(pipe)};
+    if (exit_code != 0) {
+        const std::string first_line{firstOutputLine(output)};
+        snap.status = first_line.empty() ? "pcm-memory.exe failed" : first_line;
+        return snap;
+    }
+
+    std::istringstream stream(output);
+    std::string line;
+    std::vector<std::size_t> read_columns;
+    std::vector<std::size_t> write_columns;
+    bool have_header{false};
+
+    while (std::getline(stream, line)) {
+        line = trimCopy(line);
+        if (line.empty() || line.find(',') == std::string::npos) {
+            continue;
+        }
+
+        const auto fields{splitCsvLine(line)};
+        if (fields.empty()) {
+            continue;
+        }
+
+        if (!have_header) {
+            read_columns.clear();
+            write_columns.clear();
+            for (std::size_t i{0}; i < fields.size(); ++i) {
+                const std::string header{lowerCopy(fields[i])};
+                if (header.find("mem read") != std::string::npos && header.find("mb/s") != std::string::npos) {
+                    read_columns.push_back(i);
+                } else if (header.find("mem write") != std::string::npos && header.find("mb/s") != std::string::npos) {
+                    write_columns.push_back(i);
+                }
+            }
+            have_header = !read_columns.empty() || !write_columns.empty();
+            continue;
+        }
+
+        double read_mbs{0.0};
+        double write_mbs{0.0};
+        std::size_t values{0};
+        for (const std::size_t index : read_columns) {
+            if (index < fields.size()) {
+                double value{0.0};
+                if (parseDoubleField(fields[index], value)) {
+                    read_mbs += std::max(0.0, value);
+                    ++values;
+                }
+            }
+        }
+        for (const std::size_t index : write_columns) {
+            if (index < fields.size()) {
+                double value{0.0};
+                if (parseDoubleField(fields[index], value)) {
+                    write_mbs += std::max(0.0, value);
+                    ++values;
+                }
+            }
+        }
+
+        if (values > 0) {
+            snap.read_bandwidth_mbs = read_mbs;
+            snap.write_bandwidth_mbs = write_mbs;
+            snap.total_bandwidth_mbs = read_mbs + write_mbs;
+            snap.seconds = delay_sec;
+            snap.valid = true;
+            snap.synthetic = false;
+            snap.status = "hardware counters";
+            return snap;
+        }
+    }
+
+    if (output.empty()) {
+        snap.status = "pcm-memory.exe produced no output";
+    } else {
+        const std::string first_line{firstOutputLine(output)};
+        snap.status = first_line.empty() ? "could not parse pcm-memory CSV" : "could not parse PCM output: " + first_line;
+    }
+#else
+    (void)pcm_path;
+    (void)interval_ms;
+    snap.status = "Intel PCM backend is implemented for Windows builds";
+#endif
+    return snap;
+}
+
+BandwidthProbeSnapshot sampleMemoryBandwidth(const Options& opt) {
+    if (opt.counter_backend == CounterBackend::IntelPcm) {
+        return sampleIntelPcmMemoryBandwidth(opt.pcm_path, opt.interval_ms);
+    }
+    if (opt.run_bandwidth_probe) {
+        return measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms);
+    }
+    return {};
 }
 
 #ifdef _WIN32
@@ -1118,8 +1318,22 @@ void parseArgs(int argc, char** argv, Options& opt) {
             readPositive(argc, argv, i, opt.probe_mb);
         } else if (a == "--probe-bandwidth") {
             opt.run_bandwidth_probe = true;
+            opt.counter_backend = CounterBackend::None;
         } else if (a == "--no-probe") {
             opt.run_bandwidth_probe = false;
+        } else if (a == "--counter-backend" && i + 1 < argc) {
+            const std::string value{argv[++i]};
+            if (value == "none") {
+                opt.counter_backend = CounterBackend::None;
+            } else if (value == "intel-pcm") {
+                opt.counter_backend = CounterBackend::IntelPcm;
+                opt.run_bandwidth_probe = false;
+            } else {
+                std::cerr << "Unknown counter backend: " << value << " (use none or intel-pcm)\n";
+                std::exit(1);
+            }
+        } else if (a == "--pcm-path" && i + 1 < argc) {
+            opt.pcm_path = argv[++i];
         } else if (a == "--theoretical-gbs" && i + 1 < argc) {
             readPositive(argc, argv, i, opt.theoretical_bandwidth_gbs);
             opt.theoretical_bandwidth_overridden = true;
@@ -1161,6 +1375,8 @@ void parseArgs(int argc, char** argv, Options& opt) {
                 << "  --probe-bandwidth  Run the synthetic system memory bandwidth probe (default: off)\n"
                 << "  --probe-mb N       Total memory used by the bandwidth probe when enabled (default: 256)\n"
                 << "  --no-probe         Keep synthetic bandwidth probing disabled\n"
+                << "  --counter-backend none|intel-pcm  Source for actual DRAM bandwidth counters (default: none)\n"
+                << "  --pcm-path PATH    Path to pcm-memory.exe for --counter-backend intel-pcm\n"
                 << "  --theoretical-gbs N  Override theoretical RAM bandwidth used as 100% in system mode\n"
                 << "  --gpu-vram-gbs N   Theoretical GPU VRAM bandwidth to show in system mode (default: 456.0)\n"
                 << "  --device cpu|gpu   Select target device label (default: cpu)\n"
@@ -1382,15 +1598,29 @@ void printSystemSnapshot(const std::string& target_device,
     const double total_bandwidth_ratio{(theoretical_mbs <= 0.0) ? 0.0 : bw.total_bandwidth_mbs / theoretical_mbs};
     const double gpu_memory_ratio{
         (gpu_mem.dedicated_total_mb <= 0.0) ? 0.0 : gpu_mem.dedicated_used_mb / gpu_mem.dedicated_total_mb};
+    const std::string bandwidth_source{
+        bw.valid ? (bw.synthetic ? std::string("synthetic probe") : bw.source)
+                 : (bw.status.empty() ? std::string("off") : bw.source + " unavailable")};
+    const std::string bandwidth_sample{
+        bw.valid ? formatNumber(bw.seconds * 1000.0, 0) + " ms"
+                 : (bw.status.empty() ? std::string("live counters only") : bw.status)};
+    const std::string unavailable_status{
+        bw.status.empty() ? std::string("needs hardware counters") : fitText(bw.status, 48)};
+    const std::string unavailable_line{
+        bw.status.empty() ? std::string("actual DRAM bandwidth unavailable") : fitText(bw.status, 48)};
+    const std::string read_status{bw.synthetic ? "synthetic probe read" : "hardware counter read"};
+    const std::string write_status{bw.synthetic ? "synthetic probe write" : "hardware counter write"};
+    const std::string total_status{bw.synthetic ? "synthetic probe read + write" : "hardware counter read + write"};
+    const std::string utilization_status{bw.synthetic ? "probe total / theoretical" : "counter total / theoretical"};
+    const std::string read_bytes_display{(bw.valid && bw.synthetic) ? formatBytes(bw.read_bytes) : "--"};
+    const std::string write_bytes_display{(bw.valid && bw.synthetic) ? formatBytes(bw.write_bytes) : "--"};
 
     printTopLine("MBM system memory monitor", "device " + target_device);
     std::cout << "Window: " << std::fixed << std::setprecision(0) << window_sec * 1000.0 << " ms"
               << "   Workers: " << workers
-              << "   Probe: " << (bw.valid ? formatMegabytes(probe_mb) : std::string("off"))
+              << "   BW: " << bandwidth_source
               << "   Max: " << formatMegabytesPerSecond(theoretical_mbs)
-              << "   Sample: "
-              << (bw.valid ? formatNumber(bw.seconds * 1000.0, 0) + " ms" : std::string("live counters only"))
-              << "\n";
+              << "   Sample: " << fitText(bandwidth_sample, 48) << "\n";
     std::cout << "Max source: " << theoretical_bandwidth_source << "\n";
     if (!memory_info.modules.empty()) {
         std::cout << "RAM config: " << memory_info.summary;
@@ -1455,21 +1685,21 @@ void printSystemSnapshot(const std::string& target_device,
                   << std::right << std::setw(10) << formatMegabytesPerSecond(bw.read_bandwidth_mbs)
                   << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
                   << "  " << std::setw(4) << formatPercent(read_bandwidth_ratio)
-                  << " synthetic probe read\n";
+                  << " " << read_status << "\n";
         std::cout << "Write [" << usageBar(bw.write_bandwidth_mbs, theoretical_mbs, 40) << "] "
                   << std::right << std::setw(10) << formatMegabytesPerSecond(bw.write_bandwidth_mbs)
                   << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
                   << "  " << std::setw(4) << formatPercent(write_bandwidth_ratio)
-                  << " synthetic probe write\n\n";
+                  << " " << write_status << "\n\n";
     } else {
         std::cout << " Read [" << usageBar(0.0, 1.0, 40) << "] "
                   << std::right << std::setw(10) << "--"
                   << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
-                  << "  actual DRAM read bandwidth unavailable\n";
+                  << "  " << unavailable_line << "\n";
         std::cout << "Write [" << usageBar(0.0, 1.0, 40) << "] "
                   << std::right << std::setw(10) << "--"
                   << " / " << std::setw(10) << formatMegabytesPerSecond(theoretical_mbs)
-                  << "  actual DRAM write bandwidth unavailable\n\n";
+                  << "  " << unavailable_line << "\n\n";
     }
     if (gpu_mem.valid) {
         std::cout << " VRAM [" << usageBar(gpu_mem.dedicated_used_mb, gpu_mem.dedicated_total_mb, 40) << "] "
@@ -1494,19 +1724,19 @@ void printSystemSnapshot(const std::string& target_device,
               << "\x1b[0m\n";
     std::cout << std::left << std::setw(24) << "memory_read_bandwidth"
               << std::right << std::setw(18) << (bw.valid ? formatMegabytesPerSecond(bw.read_bandwidth_mbs) : "--")
-              << "  " << (bw.valid ? "synthetic probe read" : "needs hardware counters") << "\n";
+              << "  " << (bw.valid ? read_status : unavailable_status) << "\n";
     std::cout << std::left << std::setw(24) << "memory_write_bandwidth"
               << std::right << std::setw(18) << (bw.valid ? formatMegabytesPerSecond(bw.write_bandwidth_mbs) : "--")
-              << "  " << (bw.valid ? "synthetic probe write" : "needs hardware counters") << "\n";
+              << "  " << (bw.valid ? write_status : unavailable_status) << "\n";
     std::cout << std::left << std::setw(24) << "memory_total_bandwidth"
               << std::right << std::setw(18) << (bw.valid ? formatMegabytesPerSecond(bw.total_bandwidth_mbs) : "--")
-              << "  " << (bw.valid ? "synthetic probe read + write" : "needs hardware counters") << "\n";
+              << "  " << (bw.valid ? total_status : unavailable_status) << "\n";
     std::cout << std::left << std::setw(24) << "theoretical_max"
               << std::right << std::setw(18) << formatMegabytesPerSecond(theoretical_mbs)
               << "  " << fitText(theoretical_bandwidth_source, 24) << "\n";
     std::cout << std::left << std::setw(24) << "bandwidth_utilization"
               << std::right << std::setw(18) << (bw.valid ? formatPercent(total_bandwidth_ratio) : "--")
-              << "  " << (bw.valid ? "probe total / theoretical" : "actual unavailable") << "\n";
+              << "  " << (bw.valid ? utilization_status : "actual unavailable") << "\n";
     std::cout << std::left << std::setw(24) << "gpu_vram_bandwidth"
               << std::right << std::setw(18) << formatMegabytesPerSecond(gpu_vram_mbs)
               << "  theoretical " << fitText(gpu_label, 24) << "\n";
@@ -1531,11 +1761,11 @@ void printSystemSnapshot(const std::string& target_device,
               << (gpu_mem.valid ? formatPercent(gpu_memory_ratio) : "--")
               << "  used / dedicated\n";
     std::cout << std::left << std::setw(24) << "read_bytes"
-              << std::right << std::setw(18) << (bw.valid ? formatBytes(bw.read_bytes) : "--")
-              << "  " << (bw.valid ? "touched by probe" : "probe disabled") << "\n";
+              << std::right << std::setw(18) << read_bytes_display
+              << "  " << (bw.valid && bw.synthetic ? "touched by probe" : (bw.valid ? "not reported by backend" : "probe disabled")) << "\n";
     std::cout << std::left << std::setw(24) << "write_bytes"
-              << std::right << std::setw(18) << (bw.valid ? formatBytes(bw.write_bytes) : "--")
-              << "  " << (bw.valid ? "touched by probe" : "probe disabled") << "\n";
+              << std::right << std::setw(18) << write_bytes_display
+              << "  " << (bw.valid && bw.synthetic ? "touched by probe" : (bw.valid ? "not reported by backend" : "probe disabled")) << "\n";
     std::cout << std::left << std::setw(24) << "physical_used"
               << std::right << std::setw(18) << formatMegabytes(mem.used_mb)
               << "  system\n";
@@ -1675,9 +1905,7 @@ int main(int argc, char** argv) {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(opt.interval_ms));
 
-            const auto bw{opt.run_bandwidth_probe
-                              ? measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms)
-                              : BandwidthProbeSnapshot{}};
+            const auto bw{sampleMemoryBandwidth(opt)};
             const auto now{Clock::now()};
             const double sec{std::max(1e-9, std::chrono::duration_cast<std::chrono::duration<double>>(now - last_sample_at).count())};
             const auto mem{sampleSystemMemory()};
@@ -1732,9 +1960,7 @@ int main(int argc, char** argv) {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(opt.interval_ms));
 
-            const auto bw{opt.run_bandwidth_probe
-                              ? measureSystemMemoryBandwidth(opt.workers, opt.probe_mb, opt.interval_ms)
-                              : BandwidthProbeSnapshot{}};
+            const auto bw{sampleMemoryBandwidth(opt)};
             const auto now{Clock::now()};
             const auto mem{sampleSystemMemory()};
             const auto gpu_mem{sampleGpuMemory(opt.gpu_index)};
